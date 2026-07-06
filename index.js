@@ -159,6 +159,15 @@ client.on(Events.MessageCreate, async (message) => {
 
   if (message.channelId !== guildConfig.honeypotChannelId) return;
 
+  let deletedTriggeredMessage = false;
+
+  try {
+    await message.delete();
+    deletedTriggeredMessage = true;
+  } catch (error) {
+    console.error("Could not delete honeypot message:", error.message);
+  }
+
   const mode = guildConfig.honeypotMode;
 
   if (!member) return;
@@ -178,6 +187,11 @@ client.on(Events.MessageCreate, async (message) => {
       {
         name: "User ID",
         value: `${message.author.id}`,
+        inline: true,
+      },
+      {
+        name: "Message Deleted",
+        value: deletedTriggeredMessage ? "Yes" : "No",
         inline: true,
       },
     ],
