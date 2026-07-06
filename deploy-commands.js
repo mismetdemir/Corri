@@ -9,22 +9,17 @@ import {
 
 const commands = [
   new SlashCommandBuilder()
-    .setName("ping")
-    .setDescription("Checks if the bot is online.")
-    .toJSON(),
-
-  new SlashCommandBuilder()
     .setName("help")
-    .setDescription("Shows the list of available commands.")
+    .setDescription("Shows the list of available commands")
     .toJSON(),
 
   new SlashCommandBuilder()
     .setName("set-log-channel")
-    .setDescription("Sets the server log channel.")
+    .setDescription("Sets the server log channel")
     .addChannelOption((option) =>
       option
         .setName("channel")
-        .setDescription("The channel where logs will be sent.")
+        .setDescription("The channel where logs will be sent")
         .addChannelTypes(ChannelType.GuildText)
         .setRequired(true),
     )
@@ -32,8 +27,27 @@ const commands = [
     .toJSON(),
 
   new SlashCommandBuilder()
-    .setName("test-log")
-    .setDescription("Sends a test message to the log channel.")
+    .setName("honeypot")
+    .setDescription("Sets the honeypot channel")
+    .addChannelOption((option) =>
+      option
+        .setName("channel")
+        .setDescription("The channel where honeypot will be activated")
+        .addChannelTypes(ChannelType.GuildText)
+        .setRequired(true),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("mode")
+        .setDescription("Mode")
+        .setRequired(true)
+        .addChoices(
+          { name: "Quarantine", value: "quarantine" },
+          { name: "Kick", value: "kick" },
+          { name: "Ban", value: "ban" },
+        ),
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .toJSON(),
 ];
 

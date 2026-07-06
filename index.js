@@ -6,7 +6,7 @@ import fs from "fs";
 const CONFIG_FILE = "./config.json";
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
 });
 
 function loadConfig() {
@@ -68,6 +68,84 @@ client.once(Events.ClientReady, (readyClient) => {
   console.log(`${readyClient.user.tag} is online!`);
 });
 
+client.on(Events.MessageCreate, async (message) => {
+  if (!message.guild) return;
+  if (message.author.bot) return;
+  if (member.permissions.has("ManageGuild")) return;
+
+  const config = loadConfig();
+  const guildConfig = config[message.guildId];
+
+  if (!guildConfig?.honeypotChannelId) return;
+
+  if (message.channelId !== guildConfig.honeypotChannelId) return;
+
+  const mode = guildConfig.honeypotMode;
+  const member = message.member;
+
+  if (!member) return;
+
+  const reason = "Triggered honeypot channel.";
+
+  await sendLog(message.guild.id, {
+    title: "Honeypot Triggered",
+    description: `A user sent a message to honeypot channel.`,
+    color: 0xe74c3c,
+    fields: [
+      {
+        name: "User",
+        value: `${message.author.tag}`,
+        inline: true,
+      },
+      {
+        name: "User ID",
+        value: `${message.author.id}`,
+        inline: true,
+      },
+    ],
+    footer: "Corri Honeypot System",
+  });
+
+  try {
+    if (mode === "quarantine") {
+      await member.timeout(24 * 60 * 60 * 1000, reason);
+    } else if (mode === "kick") {
+      await member.kick(reason);
+    } else if (mode === "ban") {
+      await member.ban({
+        reason,
+        deleteMessageSeconds: 60 * 60,
+      });
+    }
+  } catch (error) {
+    console.error("Honeypot action failed:", error);
+
+    await sendLog(message.guild.id, {
+      title: "Honeypot Action Failed",
+      description: "The bot could not apply the selected honeypot action.",
+      color: 0xe67e22,
+      fields: [
+        {
+          name: "User",
+          value: `${message.author.tag}`,
+          inline: true,
+        },
+        {
+          name: "User ID",
+          value: `${message.author.id}`,
+          inline: true,
+        },
+        {
+          name: "Error",
+          value: `\`${error.message}\``,
+          inline: true,
+        },
+      ],
+      footer: "Corri Honeypot System",
+    });
+  }
+});
+
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
@@ -76,56 +154,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
   console.log("Command received:", commandName);
 
   try {
-    if (commandName === "ping") {
-      await interaction.reply("Pong! The bot is online.");
-
-      await sendLog(interaction.guildId, {
-        title: "Command Used",
-        description: "`/ping` command was used.",
-        color: 0x2ecc71,
-        fields: [
-          {
-            name: "User",
-            value: `${interaction.user.tag}`,
-            inline: true,
-          },
-          {
-            name: "Channel",
-            value: `${interaction.channel}`,
-            inline: true,
-          },
-          {
-            name: "User ID",
-            value: `${interaction.user.id}`,
-            inline: false,
-          },
-        ],
-        footer: "Corri Log System",
-      });
-    } else if (commandName === "help") {
+    if (commandName === "help") {
       const helpEmbed = new EmbedBuilder()
         .setColor(0x3498db)
         .setTitle("Corri Help Menu")
         .setDescription("Here are the available commands.")
         .addFields(
           {
-            name: "/ping",
-            value: "Checks if the bot is online.",
-            inline: false,
-          },
-          {
-            name: "/help",
-            value: "Shows this help message.",
-            inline: false,
-          },
-          {
             name: "/set-log-channel",
-            value: "Sets the server log channel.",
+            value: "Sets the server log channel",
             inline: false,
           },
           {
-            name: "/test-log",
-            value: "Sends a test log message.",
+            name: "/honeypot",
+            value: "Sets the honeypot channel and action mode",
             inline: false,
           },
         )
@@ -158,12 +200,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const config = loadConfig();
 
       config[interaction.guildId] = {
+        ...config[interaction.guildId],
         logChannelId: channel.id,
       };
 
       saveConfig(config);
 
-      await interaction.reply(`✅ Log channel has been set to ${channel}.`);
+      await interaction.reply(`**Log channel** has been set to ${channel}.`);
 
       const setupEmbed = new EmbedBuilder()
         .setColor(0x2ecc71)
@@ -187,40 +230,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setFooter({ text: "Corri Log System" });
 
       await channel.send({ embeds: [setupEmbed] });
-    } else if (commandName === "test-log") {
-      const logSent = await sendLog(interaction.guildId, {
-        title: "Test Log",
-        description: "This is a test log message.",
-        color: 0x9b59b6,
-        fields: [
-          {
-            name: "Sent By",
-            value: `${interaction.user.tag}`,
-            inline: true,
-          },
-          {
-            name: "Channel",
-            value: `${interaction.channel}`,
-            inline: true,
-          },
-          {
-            name: "Status",
-            value: "Log system is working correctly.",
-            inline: false,
-          },
-        ],
-        footer: "Corri Log System",
+    } else if (commandName === "honeypot") {
+      const channel = interaction.options.getChannel("channel");
+      const mode = interaction.options.getString("mode");
+      const config = loadConfig();
+
+      config[interaction.guildId] = {
+        ...config[interaction.guildId],
+        honeypotChannelId: channel.id,
+        honeypotMode: mode,
+      };
+
+      saveConfig(config);
+
+      await interaction.reply({
+        content: `Honeypot channel set to ${channel}\nMode: \`${mode}\``,
+        ephemeral: true,
       });
 
-      if (logSent) {
-        await interaction.reply("✅ Test log sent successfully.");
-      } else {
-        await interaction.reply({
-          content:
-            "❌ Log channel is not set or I cannot send messages there. Use `/set-log-channel` first.",
-          ephemeral: true,
-        });
-      }
+      const actionText = {
+        quarantine: "you will be quarantined",
+        kick: "you will be kicked",
+        ban: "you will be banned",
+      };
+
+      const setupEmbed = new EmbedBuilder()
+        .setColor(0xf1c40f)
+        .setTitle("Honeypot Channel")
+        .setDescription(
+          `⛔ **CAUTION** ⛔\n\n` +
+            `This channel is set as the honeypot channel.\n` +
+            `If you send any message to this channel, **${actionText[mode]}**.`,
+        )
+        .setTimestamp()
+        .setFooter({ text: "Corri Honeypot System" });
+
+      await channel.send({ embeds: [setupEmbed] });
     } else {
       await interaction.reply({
         content: "Unknown command.",
