@@ -1,5 +1,11 @@
 import "dotenv/config";
-import { Client, Events, GatewayIntentBits, EmbedBuilder } from "discord.js";
+import {
+  Client,
+  Events,
+  GatewayIntentBits,
+  EmbedBuilder,
+  PermissionFlagsBits,
+} from "discord.js";
 
 import fs from "fs";
 
@@ -25,6 +31,76 @@ function loadConfig() {
 
 function saveConfig(config) {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+}
+
+const QUARANTINE_ROLE_NAME = "Quarantined";
+
+async function getOrCreateQuarantineRole(guild) {
+  const config = loadConfig();
+  const guildConfig = config[guild.id] || {};
+
+  let role = null;
+
+  if (guildConfig.quarantineRoleId) {
+    role = await guild.roles
+      .fetch(guildConfig.quarantineRoleId)
+      .catch(() => null);
+  }
+
+  if (!role) {
+    role = guild.roles.cache.find((r) => r.name === QUARANTINE_ROLE_NAME);
+  }
+
+  if (!role) {
+    role = await guild.roles.create({
+      name: QUARANTINE_ROLE_NAME,
+      colors: 0x2f3136,
+      permissions: [],
+      reason: "Automatic quarantine role for honeypot system.",
+    });
+  }
+
+  config[guild.id] = {
+    ...guildConfig,
+    quarantineRoleId: role.id,
+  };
+
+  saveConfig(config);
+
+  return role;
+}
+
+async function applyQuarantinePermissions(guild, role) {
+  const channels = await guild.channels.fetch();
+
+  for (const channel of channels.values()) {
+    if (!channel) continue;
+    if (channel.isThread?.()) continue;
+    if (!channel.permissionOverwrites?.edit) continue;
+
+    await channel.permissionOverwrites
+      .edit(
+        role.id,
+        {
+          SendMessages: false,
+          AddReactions: false,
+          CreatePublicThreads: false,
+          CreatePrivateThreads: false,
+          SendMessagesInThreads: false,
+          Connect: false,
+          Speak: false,
+        },
+        {
+          reason: "Applying quarantine role permissions.",
+        },
+      )
+      .catch((error) => {
+        console.error(
+          `Could not edit permissions for ${channel.name}:`,
+          error.message,
+        );
+      });
+  }
 }
 
 async function sendLog(guildId, logData) {
@@ -71,6 +147,9 @@ client.once(Events.ClientReady, (readyClient) => {
 client.on(Events.MessageCreate, async (message) => {
   if (!message.guild) return;
   if (message.author.bot) return;
+
+  const member = message.member;
+
   if (member.permissions.has("ManageGuild")) return;
 
   const config = loadConfig();
@@ -81,7 +160,6 @@ client.on(Events.MessageCreate, async (message) => {
   if (message.channelId !== guildConfig.honeypotChannelId) return;
 
   const mode = guildConfig.honeypotMode;
-  const member = message.member;
 
   if (!member) return;
 
@@ -108,7 +186,20 @@ client.on(Events.MessageCreate, async (message) => {
 
   try {
     if (mode === "quarantine") {
-      await member.timeout(24 * 60 * 60 * 1000, reason);
+      let quarantineRole = null;
+
+      if (guildConfig.quarantineRoleId) {
+        quarantineRole = await message.guild.roles
+          .fetch(guildConfig.quarantineRoleId)
+          .catch(() => null);
+      }
+
+      if (!quarantineRole) {
+        quarantineRole = await getOrCreateQuarantineRole(message.guild);
+        await applyQuarantinePermissions(message.guild, quarantineRole);
+      }
+
+      await member.roles.add(quarantineRole, reason);
     } else if (mode === "kick") {
       await member.kick(reason);
     } else if (mode === "ban") {
@@ -231,21 +322,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await channel.send({ embeds: [setupEmbed] });
     } else if (commandName === "honeypot") {
+      await interaction.deferReply({
+        ephemeral: true,
+      });
+
       const channel = interaction.options.getChannel("channel");
       const mode = interaction.options.getString("mode");
       const config = loadConfig();
+
+      let quarantineRole = null;
+
+      if (mode === "quarantine") {
+        quarantineRole = await getOrCreateQuarantineRole(interaction.guild);
+        await applyQuarantinePermissions(interaction.guild, quarantineRole);
+      }
 
       config[interaction.guildId] = {
         ...config[interaction.guildId],
         honeypotChannelId: channel.id,
         honeypotMode: mode,
+        quarantineRoleId:
+          quarantineRole?.id || config[interaction.guildId]?.quarantineRoleId,
       };
 
       saveConfig(config);
 
-      await interaction.reply({
+      await interaction.editReply({
         content: `Honeypot channel set to ${channel}\nMode: \`${mode}\``,
-        ephemeral: true,
       });
 
       const actionText = {
