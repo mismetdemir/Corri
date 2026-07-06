@@ -181,7 +181,7 @@ client.on(Events.MessageCreate, async (message) => {
     fields: [
       {
         name: "User",
-        value: `${message.author.tag}`,
+        value: `<@${message.author.id}>`,
         inline: true,
       },
       {
@@ -232,7 +232,7 @@ client.on(Events.MessageCreate, async (message) => {
       fields: [
         {
           name: "User",
-          value: `${message.author.tag}`,
+          value: `<@${message.author.id}>`,
           inline: true,
         },
         {
@@ -280,25 +280,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setFooter({ text: "Corri Bot" });
 
       await interaction.reply({ embeds: [helpEmbed] });
-
-      await sendLog(interaction.guildId, {
-        title: "Command Used",
-        description: "`/help` command was used.",
-        color: 0x3498db,
-        fields: [
-          {
-            name: "User",
-            value: `${interaction.user.tag}`,
-            inline: true,
-          },
-          {
-            name: "Channel",
-            value: `${interaction.channel}`,
-            inline: true,
-          },
-        ],
-        footer: "Corri Log System",
-      });
     } else if (commandName === "set-log-channel") {
       const channel = interaction.options.getChannel("channel");
 
