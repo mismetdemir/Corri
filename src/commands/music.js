@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 
 const musicSessions = new Map();
 
-console.log("[music] Corri music engine v4 hybrid-optimized loaded");
+console.log("[music] Corri music engine v4.2 full-pipeline-warmup loaded");
 
 const IDLE_DISCONNECT_MS = 2 * 60 * 1000;
 const MAX_QUEUE_DISPLAY = 15;
@@ -178,15 +178,35 @@ async function resolveTrack(query, requestedBy) {
      */
     const search = await youtube.search(cleanQuery, { type: "video" });
 
-    firstVideo =
-      search.videos.find((video) => video?.video_id) ||
-      search.videos.find((video) => video?.id);
+    const videos = Array.from(search.videos || []);
+
+    /*
+     * Preserve YouTube's ACTUAL result order.
+     *
+     * Important: do not do
+     *   find(video_id) || find(id)
+     * because that can skip an earlier result using `id` and select a later
+     * result using `video_id`.
+     */
+    firstVideo = videos.find(
+      (video) => video?.video_id || video?.id,
+    );
 
     if (!firstVideo) {
       return null;
     }
 
     videoId = firstVideo.video_id || firstVideo.id;
+
+    console.log(
+      `[music] search "${cleanQuery}" first candidates: ${videos
+        .slice(0, 3)
+        .map(
+          (video, index) =>
+            `${index + 1}. ${video?.title?.toString?.() || video?.title?.text || "Untitled"} [${video?.video_id || video?.id || "no-id"}]`,
+        )
+        .join(" | ")}`,
+    );
   }
 
   const url = `https://www.youtube.com/watch?v=${videoId}`;
@@ -333,6 +353,11 @@ function createTrackStream(track, { prefetch = false } = {}) {
   let exitCode = null;
   let errorOutput = "";
   let firstByteAt = null;
+  let resolveFirstByte;
+
+  const firstBytePromise = new Promise((resolve) => {
+    resolveFirstByte = resolve;
+  });
 
   const outputStream = prefetch
     ? new PassThrough({ highWaterMark: PREFETCH_BUFFER_BYTES })
@@ -340,6 +365,13 @@ function createTrackStream(track, { prefetch = false } = {}) {
 
   ytProcess.stdout.once("data", () => {
     firstByteAt = performance.now();
+
+    resolveFirstByte?.({
+      ok: true,
+      elapsedMs: Math.round(firstByteAt - startedAt),
+    });
+    resolveFirstByte = null;
+
     console.log(
       `[music] yt-dlp first audio byte: ${Math.round(firstByteAt - startedAt)} ms (${track.title})`,
     );
@@ -364,6 +396,7 @@ function createTrackStream(track, { prefetch = false } = {}) {
     prefetched: prefetch,
     stopped: false,
     startedAt,
+    firstBytePromise,
     get closed() { return closed; },
     get exitCode() { return exitCode; },
     get firstByteAt() { return firstByteAt; },
@@ -393,6 +426,15 @@ function createTrackStream(track, { prefetch = false } = {}) {
   ytProcess.on("close", (code) => {
     closed = true;
     exitCode = code;
+
+    if (resolveFirstByte) {
+      resolveFirstByte({
+        ok: false,
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+      resolveFirstByte = null;
+    }
+
     if (intentionallyStopped) return;
 
     if (code !== 0) {
@@ -403,6 +445,157 @@ function createTrackStream(track, { prefetch = false } = {}) {
 
   return controller;
 }
+
+/*
+ * FULL STARTUP WARMUP
+ *
+ * The user's Wispbyte logs showed:
+ *   first YouTube search: ~16.4 s
+ *   next YouTube search:  ~0.8 s
+ *   yt-dlp first byte:    ~5-7 s
+ *
+ * So we pay those cold-start costs in the background while the bot is
+ * starting rather than after a user sends the first /play command.
+ *
+ * IMPORTANT: this does NOT change resolveTrack() or Corri's search ranking.
+ * The warm-up result is discarded and never enters the music queue/cache.
+ */
+let pipelineWarmupPromise = null;
+
+function warmPlaybackPipeline() {
+  if (pipelineWarmupPromise) {
+    return pipelineWarmupPromise;
+  }
+
+  pipelineWarmupPromise = (async () => {
+    const totalStartedAt = performance.now();
+    let warmController = null;
+
+    try {
+      const youtube = await getYouTube();
+
+      const searchStartedAt = performance.now();
+
+      /*
+       * This request warms the actual YouTube SEARCH path, not only
+       * Innertube.create(). It is intentionally unrelated to user queries.
+       */
+      const warmSearch = await youtube.search("music", {
+        type: "video",
+      });
+
+      const videos = Array.from(warmSearch.videos || []);
+      const firstVideo = videos.find(
+        (video) => video?.video_id || video?.id,
+      );
+
+      const videoId =
+        firstVideo?.video_id ||
+        firstVideo?.id ||
+        null;
+
+      console.log(
+        `[music] startup search warmup: ${Math.round(
+          performance.now() - searchStartedAt,
+        )} ms`,
+      );
+
+      if (!videoId) {
+        console.warn(
+          "[music] startup warmup search returned no usable video; audio warmup skipped",
+        );
+        return;
+      }
+
+      const warmUrl =
+        `https://www.youtube.com/watch?v=${videoId}`;
+
+      /*
+       * Warm metadata and yt-dlp at the same time, exactly like the real
+       * optimized /play path.
+       */
+      const metadataWarmup = youtube
+        .getBasicInfo(videoId)
+        .catch(() => null);
+
+      const warmTrack = {
+        key: randomUUID(),
+        query: "__corri_startup_warmup__",
+        target: warmUrl,
+        id: videoId,
+        title: "__Corri startup warmup__",
+        url: warmUrl,
+        author: "YouTube",
+        duration: null,
+        thumbnail: null,
+        requestedBy: "0",
+        metadataResolved: false,
+      };
+
+      warmController = createTrackStream(
+        warmTrack,
+        { prefetch: true },
+      );
+
+      const firstByteResult = await Promise.race([
+        warmController.firstBytePromise,
+        new Promise((resolve) => {
+          setTimeout(
+            () =>
+              resolve({
+                ok: false,
+                elapsedMs: 12_000,
+                timeout: true,
+              }),
+            12_000,
+          );
+        }),
+      ]);
+
+      await metadataWarmup;
+
+      console.log(
+        `[music] startup audio warmup: ${
+          firstByteResult.ok
+            ? `${firstByteResult.elapsedMs} ms to first byte`
+            : firstByteResult.timeout
+              ? "timed out after 12000 ms"
+              : `ended after ${firstByteResult.elapsedMs} ms`
+        }`,
+      );
+    } catch (error) {
+      /*
+       * Warmup is purely an optimization. Never let it prevent the bot from
+       * starting or poison future real /play requests.
+       */
+      console.warn(
+        "[music] startup pipeline warmup failed; normal /play remains available:",
+        error.message,
+      );
+
+      if (!youtubePromise) {
+        youtubePromise = null;
+      }
+    } finally {
+      warmController?.stop();
+
+      console.log(
+        `[music] startup pipeline warmup finished in ${Math.round(
+          performance.now() - totalStartedAt,
+        )} ms`,
+      );
+    }
+  })();
+
+  return pipelineWarmupPromise;
+}
+
+/*
+ * Do not await this. Discord login and the warmup run concurrently.
+ */
+setImmediate(() => {
+  void warmPlaybackPipeline();
+});
 
 
 async function sendSessionMessage(session, payload) {
