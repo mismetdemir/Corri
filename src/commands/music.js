@@ -9,24 +9,27 @@ import {
   joinVoiceChannel,
 } from "@discordjs/voice";
 import { EmbedBuilder, MessageFlags, PermissionFlagsBits } from "discord.js";
-import { Innertube } from "youtubei.js";
+import { Innertube, UniversalCache } from "youtubei.js";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { PassThrough } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 const musicSessions = new Map();
 
-console.log("[music] Corri music engine v4.2 full-pipeline-warmup loaded");
+console.log("[music] Corri music engine v5 native-race loaded");
 
 const IDLE_DISCONNECT_MS = 2 * 60 * 1000;
 const MAX_QUEUE_DISPLAY = 15;
 const PREFETCH_BUFFER_BYTES = 512 * 1024;
 const TRACK_CACHE_TTL_MS = 30 * 60 * 1000;
 const TRACK_CACHE_MAX = 100;
+const SAFE_HEDGE_DELAY_MS = 1800;
+const SOURCE_BUFFER_BYTES = 512 * 1024;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -37,36 +40,74 @@ const YT_DLP_BINARY = path.resolve(
   process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp",
 );
 
-// Keep yt-dlp's player/signature cache inside the project so it survives restarts.
-const YT_DLP_CACHE_DIR = path.resolve(__dirname, "../../.cache/yt-dlp");
+// Persist both yt-dlp and YouTube.js player/session caches across restarts.
+const CACHE_ROOT = path.resolve(__dirname, "../../.cache");
+const YT_DLP_CACHE_DIR = path.join(CACHE_ROOT, "yt-dlp");
+const YTJS_CACHE_DIR = path.join(CACHE_ROOT, "youtubejs");
 fs.mkdirSync(YT_DLP_CACHE_DIR, { recursive: true });
+fs.mkdirSync(YTJS_CACHE_DIR, { recursive: true });
+
+const YTJS_CACHE = new UniversalCache(true, YTJS_CACHE_DIR);
 
 // Prefer native YouTube Opus streams. No FFmpeg/transcoding is needed.
 const FORMAT_SELECTOR =
   "251/250/249/bestaudio[ext=webm][acodec=opus]/bestaudio[ext=webm]";
 
-// Skip manifests/subtitle work that Corri never uses.
-const YOUTUBE_EXTRACTOR_ARGS = "youtube:skip=hls,dash,translated_subs";
+// Fast yt-dlp path: use one token-free embedded client and skip the initial-data
+// request Corri does not need. Non-embeddable videos automatically fall back.
+const FAST_YOUTUBE_EXTRACTOR_ARGS =
+  "youtube:player_client=web_embedded;player_skip=initial_data;skip=hls,dash,translated_subs";
+
+// Safe path preserves yt-dlp's normal client selection.
+const SAFE_YOUTUBE_EXTRACTOR_ARGS =
+  "youtube:skip=hls,dash,translated_subs";
 
 /*
  * Search/metadata resolution uses YouTube's own internal API through
  * youtubei.js. yt-dlp is then given the exact watch URL instead of doing
  * its own text search.
  *
- * Text search uses a single YouTube request. We intentionally do NOT call
- * getBasicInfo() after search because the search result already contains
- * the metadata Corri needs for the queue embed.
+ * Text search itself uses one YouTube search request. getBasicInfo() starts
+ * afterwards only as a parallel metadata/native-audio path; it never blocks
+ * yt-dlp from starting.
  */
 let youtubePromise = null;
 const trackCache = new Map();
 
 function getYouTube() {
   if (!youtubePromise) {
-    youtubePromise = Innertube.create();
+    const startedAt = performance.now();
+
+    youtubePromise = Innertube.create({
+      cache: YTJS_CACHE,
+    })
+      .then((youtube) => {
+        console.log(
+          `[music] YouTube.js session ready in ${Math.round(
+            performance.now() - startedAt,
+          )} ms`,
+        );
+        return youtube;
+      })
+      .catch((error) => {
+        youtubePromise = null;
+        throw error;
+      });
   }
 
   return youtubePromise;
 }
+
+// Initialize the real session during bot startup, but do not run fake searches
+// or fake audio downloads. Persistent cache does the useful work across restarts.
+setImmediate(() => {
+  void getYouTube().catch((error) => {
+    console.warn(
+      "[music] YouTube.js startup initialization failed; /play will retry:",
+      error.message,
+    );
+  });
+});
 
 function extractYouTubeVideoId(input) {
   try {
@@ -126,6 +167,7 @@ function getCachedTrack(query, requestedBy) {
 
   return {
     ...cached.track,
+    mediaInfo: cached.mediaInfo || null,
     key: randomUUID(),
     query,
     requestedBy,
@@ -138,6 +180,7 @@ function putCachedTrack(query, track) {
   trackCache.delete(key);
   trackCache.set(key, {
     cachedAt: Date.now(),
+    mediaInfo: track.mediaInfo || null,
     track: {
       target: track.target,
       id: track.id,
@@ -231,6 +274,7 @@ async function resolveTrack(query, requestedBy) {
     thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
     requestedBy,
     metadataResolved: false,
+    mediaInfo: null,
   };
 
   console.log(
@@ -244,6 +288,7 @@ async function resolveTrack(query, requestedBy) {
       const metadataStartedAt = performance.now();
       const info = await youtube.getBasicInfo(videoId);
       const basicInfo = info.basic_info;
+      track.mediaInfo = info;
 
       if (basicInfo?.title) {
         track.title = basicInfo.title;
@@ -325,33 +370,29 @@ function createTrackStream(track, { prefetch = false } = {}) {
     throw new Error(`yt-dlp binary not found at ${YT_DLP_BINARY}. Run npm install first.`);
   }
 
-  // The resolver already chose one exact YouTube video. yt-dlp only extracts
-  // and streams that video's native WebM/Opus audio.
-  const args = [
-    "--output", "-",
-    "--format", FORMAT_SELECTOR,
-    "--no-playlist",
-    "--no-progress",
-    "--quiet",
-    "--no-warnings",
-    "--cache-dir", YT_DLP_CACHE_DIR,
-    "--js-runtimes", `node:${process.execPath}`,
-    "--extractor-args", YOUTUBE_EXTRACTOR_ARGS,
-    track.target,
-  ];
-
   const startedAt = performance.now();
-  console.log(`[music] ${prefetch ? "prefetch" : "stream"} start: ${track.title}`);
-
-  const ytProcess = spawn(YT_DLP_BINARY, args, {
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
+  const outputStream = new PassThrough({
+    highWaterMark: prefetch ? PREFETCH_BUFFER_BYTES : SOURCE_BUFFER_BYTES,
   });
 
-  let intentionallyStopped = false;
-  let closed = false;
-  let exitCode = null;
-  let errorOutput = "";
+  // A prefetched source can fail before Discord has attached its own error
+  // handler. Keep the process alive and let the synthetic lifecycle report it.
+  outputStream.on("error", (error) => {
+    if (!stopped) {
+      console.warn(`[music] output stream error (${track.title}):`, error.message);
+    }
+  });
+
+  // Existing code expects controller.process.once("close"). Use a synthetic
+  // lifecycle emitter because the winning source can be YouTube.js or yt-dlp.
+  const lifecycle = new EventEmitter();
+  const attempts = new Map();
+
+  let winner = null;
+  let stopped = false;
+  let safeStarted = false;
+  let hedgeTimer = null;
+  let lifecycleClosed = false;
   let firstByteAt = null;
   let resolveFirstByte;
 
@@ -359,244 +400,314 @@ function createTrackStream(track, { prefetch = false } = {}) {
     resolveFirstByte = resolve;
   });
 
-  const outputStream = prefetch
-    ? new PassThrough({ highWaterMark: PREFETCH_BUFFER_BYTES })
-    : ytProcess.stdout;
+  const emitClose = (code) => {
+    if (lifecycleClosed) return;
+    lifecycleClosed = true;
+    lifecycle.emit("close", code);
+  };
 
-  ytProcess.stdout.once("data", () => {
+  const settleFirstByte = (value) => {
+    if (!resolveFirstByte) return;
+    resolveFirstByte(value);
+    resolveFirstByte = null;
+  };
+
+  const stopAttempt = (attempt) => {
+    if (!attempt || attempt.stopped) return;
+    attempt.stopped = true;
+
+    try { attempt.source?.unpipe(attempt.buffer); } catch {}
+    try { attempt.source?.destroy(); } catch {}
+    try { attempt.buffer?.destroy(); } catch {}
+    try { attempt.process?.stderr?.destroy(); } catch {}
+
+    if (attempt.process && !attempt.process.killed) {
+      try { attempt.process.kill("SIGTERM"); } catch {}
+    }
+  };
+
+  const chooseWinner = (attempt) => {
+    if (stopped || winner || attempt.stopped) return;
+
+    winner = attempt;
     firstByteAt = performance.now();
 
-    resolveFirstByte?.({
-      ok: true,
-      elapsedMs: Math.round(firstByteAt - startedAt),
-    });
-    resolveFirstByte = null;
+    if (hedgeTimer) {
+      clearTimeout(hedgeTimer);
+      hedgeTimer = null;
+    }
+
+    const elapsedMs = Math.round(firstByteAt - startedAt);
 
     console.log(
-      `[music] yt-dlp first audio byte: ${Math.round(firstByteAt - startedAt)} ms (${track.title})`,
+      `[music] source winner: ${attempt.name} in ${elapsedMs} ms (${track.title})`,
     );
-  });
 
-  if (prefetch) ytProcess.stdout.pipe(outputStream);
+    settleFirstByte({
+      ok: true,
+      elapsedMs,
+      source: attempt.name,
+    });
 
-  ytProcess.stderr.on("data", (data) => {
-    errorOutput += data.toString();
-  });
+    // The attempt has already buffered its first bytes. Drain those bytes into
+    // the stream Discord is already waiting on, then continue live.
+    attempt.buffer.pipe(outputStream);
 
-  ytProcess.on("error", (error) => {
-    if (!intentionallyStopped) {
-      console.error(`[music] yt-dlp process error (${track.title}):`, error);
+    for (const other of attempts.values()) {
+      if (other !== attempt) stopAttempt(other);
     }
-  });
+
+    attempt.buffer.once("end", () => {
+      emitClose(0);
+    });
+
+    attempt.buffer.once("error", (error) => {
+      if (stopped) return;
+      console.error(`[music] winning source error (${attempt.name}):`, error.message);
+      outputStream.destroy(error);
+      emitClose(1);
+    });
+  };
+
+  const activeAttemptExists = () =>
+    [...attempts.values()].some((attempt) => !attempt.finished && !attempt.stopped);
+
+  const failIfExhausted = () => {
+    if (stopped || winner || !safeStarted || activeAttemptExists()) return;
+
+    const error = new Error(`All audio sources failed for ${track.title}`);
+    console.error(`[music] ${error.message}`);
+
+    settleFirstByte({
+      ok: false,
+      elapsedMs: Math.round(performance.now() - startedAt),
+    });
+
+    outputStream.destroy(error);
+    emitClose(1);
+  };
+
+  const startSafeYtDlp = () => {
+    if (stopped || winner || safeStarted) return;
+    safeStarted = true;
+    startYtDlpAttempt("yt-dlp-default", SAFE_YOUTUBE_EXTRACTOR_ARGS, false);
+  };
+
+  const startYtDlpAttempt = (name, extractorArgs, fast) => {
+    if (stopped || winner) return null;
+
+    const attempt = {
+      name,
+      process: null,
+      source: null,
+      buffer: new PassThrough({ highWaterMark: SOURCE_BUFFER_BYTES }),
+      finished: false,
+      stopped: false,
+      errorOutput: "",
+    };
+
+    attempts.set(name, attempt);
+
+    const args = [
+      "--output", "-",
+      "--format", FORMAT_SELECTOR,
+      "--no-playlist",
+      "--no-progress",
+      "--quiet",
+      "--no-warnings",
+      "--force-ipv4",
+      "--cache-dir", YT_DLP_CACHE_DIR,
+      "--js-runtimes", `node:${process.execPath}`,
+      "--extractor-retries", fast ? "0" : "1",
+      "--socket-timeout", fast ? "6" : "10",
+      "--extractor-args", extractorArgs,
+      track.target,
+    ];
+
+    console.log(`[music] source attempt: ${name} (${track.title})`);
+
+    const child = spawn(YT_DLP_BINARY, args, {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    attempt.process = child;
+    attempt.source = child.stdout;
+
+    child.stdout.pipe(attempt.buffer);
+
+    child.stdout.once("data", () => {
+      chooseWinner(attempt);
+    });
+
+    child.stderr.on("data", (data) => {
+      attempt.errorOutput += data.toString();
+    });
+
+    child.on("error", (error) => {
+      if (!attempt.stopped && !winner) {
+        console.warn(`[music] ${name} process error:`, error.message);
+      }
+    });
+
+    child.on("close", (code) => {
+      attempt.finished = true;
+
+      if (attempt.stopped) return;
+
+      if (winner === attempt) {
+        if (code !== 0) {
+          console.warn(`[music] winning ${name} exited with code ${code}`);
+        }
+        return;
+      }
+
+      if (!winner) {
+        console.log(`[music] ${name} ended before audio (code ${code})`);
+
+        if (fast && !safeStarted) {
+          startSafeYtDlp();
+        }
+
+        if (!fast && attempt.errorOutput.trim()) {
+          console.error(attempt.errorOutput.trim());
+        }
+      }
+
+      failIfExhausted();
+    });
+
+    return attempt;
+  };
+
+  const startNativeYouTubeAttempt = () => {
+    const attempt = {
+      name: "youtubejs-native",
+      process: null,
+      source: null,
+      buffer: new PassThrough({ highWaterMark: SOURCE_BUFFER_BYTES }),
+      finished: false,
+      stopped: false,
+    };
+
+    attempts.set(attempt.name, attempt);
+
+    void (async () => {
+      try {
+        await track.metadataReady;
+
+        if (stopped || winner || attempt.stopped) return;
+
+        if (!track.mediaInfo) {
+          throw new Error("YouTube.js streaming data unavailable");
+        }
+
+        const webStream = await track.mediaInfo.download({
+          type: "audio",
+          format: "webm",
+          codec: "opus",
+          quality: "best",
+        });
+
+        if (stopped || winner || attempt.stopped) {
+          try { await webStream.cancel(); } catch {}
+          return;
+        }
+
+        const nodeStream = Readable.fromWeb(webStream);
+        attempt.source = nodeStream;
+
+        nodeStream.pipe(attempt.buffer);
+
+        nodeStream.once("data", () => {
+          chooseWinner(attempt);
+        });
+
+        nodeStream.once("error", (error) => {
+          attempt.finished = true;
+
+          if (winner === attempt) {
+            attempt.buffer.destroy(error);
+            return;
+          }
+
+          if (!attempt.stopped && !winner) {
+            console.log(`[music] youtubejs-native unavailable: ${error.message}`);
+          }
+
+          failIfExhausted();
+        });
+
+        nodeStream.once("end", () => {
+          attempt.finished = true;
+          failIfExhausted();
+        });
+      } catch (error) {
+        attempt.finished = true;
+
+        if (!attempt.stopped && !winner) {
+          console.log(`[music] youtubejs-native unavailable: ${error.message}`);
+        }
+
+        failIfExhausted();
+      }
+    })();
+  };
+
+  console.log(`[music] source race start: ${track.title}`);
+
+  // Native YouTube.js reuses the getBasicInfo request already running for
+  // metadata. In parallel, web_embedded gives yt-dlp a one-client fast path.
+  startNativeYouTubeAttempt();
+  startYtDlpAttempt("yt-dlp-web-embedded", FAST_YOUTUBE_EXTRACTOR_ARGS, true);
+
+  // Keep reliability: if neither fast route produces bytes quickly, start the
+  // old default extractor in parallel. First source to deliver audio wins.
+  hedgeTimer = setTimeout(() => {
+    if (!winner && !stopped) {
+      console.log(`[music] fast sources still pending; starting safe yt-dlp hedge`);
+      startSafeYtDlp();
+    }
+  }, SAFE_HEDGE_DELAY_MS);
 
   const controller = {
-    process: ytProcess,
+    process: lifecycle,
     stream: outputStream,
     track,
     prefetched: prefetch,
     stopped: false,
     startedAt,
     firstBytePromise,
-    get closed() { return closed; },
-    get exitCode() { return exitCode; },
+    get closed() { return lifecycleClosed; },
+    get exitCode() { return lifecycleClosed ? 0 : null; },
     get firstByteAt() { return firstByteAt; },
     stop() {
       if (controller.stopped) return;
       controller.stopped = true;
-      intentionallyStopped = true;
+      stopped = true;
 
-      try {
-        if (prefetch) ytProcess.stdout.unpipe(outputStream);
-      } catch {}
+      if (hedgeTimer) {
+        clearTimeout(hedgeTimer);
+        hedgeTimer = null;
+      }
+
+      for (const attempt of attempts.values()) {
+        stopAttempt(attempt);
+      }
+
+      settleFirstByte({
+        ok: false,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        stopped: true,
+      });
 
       try { outputStream.destroy(); } catch {}
-
-      if (outputStream !== ytProcess.stdout) {
-        try { ytProcess.stdout.destroy(); } catch {}
-      }
-
-      try { ytProcess.stderr.destroy(); } catch {}
-
-      if (!closed) {
-        try { ytProcess.kill("SIGTERM"); } catch {}
-      }
+      emitClose(0);
     },
   };
 
-  ytProcess.on("close", (code) => {
-    closed = true;
-    exitCode = code;
-
-    if (resolveFirstByte) {
-      resolveFirstByte({
-        ok: false,
-        elapsedMs: Math.round(performance.now() - startedAt),
-      });
-      resolveFirstByte = null;
-    }
-
-    if (intentionallyStopped) return;
-
-    if (code !== 0) {
-      console.error(`[music] yt-dlp exited with code ${code}: ${track.title}`);
-      if (errorOutput.trim()) console.error(errorOutput.trim());
-    }
-  });
-
   return controller;
 }
-
-/*
- * FULL STARTUP WARMUP
- *
- * The user's Wispbyte logs showed:
- *   first YouTube search: ~16.4 s
- *   next YouTube search:  ~0.8 s
- *   yt-dlp first byte:    ~5-7 s
- *
- * So we pay those cold-start costs in the background while the bot is
- * starting rather than after a user sends the first /play command.
- *
- * IMPORTANT: this does NOT change resolveTrack() or Corri's search ranking.
- * The warm-up result is discarded and never enters the music queue/cache.
- */
-let pipelineWarmupPromise = null;
-
-function warmPlaybackPipeline() {
-  if (pipelineWarmupPromise) {
-    return pipelineWarmupPromise;
-  }
-
-  pipelineWarmupPromise = (async () => {
-    const totalStartedAt = performance.now();
-    let warmController = null;
-
-    try {
-      const youtube = await getYouTube();
-
-      const searchStartedAt = performance.now();
-
-      /*
-       * This request warms the actual YouTube SEARCH path, not only
-       * Innertube.create(). It is intentionally unrelated to user queries.
-       */
-      const warmSearch = await youtube.search("music", {
-        type: "video",
-      });
-
-      const videos = Array.from(warmSearch.videos || []);
-      const firstVideo = videos.find(
-        (video) => video?.video_id || video?.id,
-      );
-
-      const videoId =
-        firstVideo?.video_id ||
-        firstVideo?.id ||
-        null;
-
-      console.log(
-        `[music] startup search warmup: ${Math.round(
-          performance.now() - searchStartedAt,
-        )} ms`,
-      );
-
-      if (!videoId) {
-        console.warn(
-          "[music] startup warmup search returned no usable video; audio warmup skipped",
-        );
-        return;
-      }
-
-      const warmUrl =
-        `https://www.youtube.com/watch?v=${videoId}`;
-
-      /*
-       * Warm metadata and yt-dlp at the same time, exactly like the real
-       * optimized /play path.
-       */
-      const metadataWarmup = youtube
-        .getBasicInfo(videoId)
-        .catch(() => null);
-
-      const warmTrack = {
-        key: randomUUID(),
-        query: "__corri_startup_warmup__",
-        target: warmUrl,
-        id: videoId,
-        title: "__Corri startup warmup__",
-        url: warmUrl,
-        author: "YouTube",
-        duration: null,
-        thumbnail: null,
-        requestedBy: "0",
-        metadataResolved: false,
-      };
-
-      warmController = createTrackStream(
-        warmTrack,
-        { prefetch: true },
-      );
-
-      const firstByteResult = await Promise.race([
-        warmController.firstBytePromise,
-        new Promise((resolve) => {
-          setTimeout(
-            () =>
-              resolve({
-                ok: false,
-                elapsedMs: 12_000,
-                timeout: true,
-              }),
-            12_000,
-          );
-        }),
-      ]);
-
-      await metadataWarmup;
-
-      console.log(
-        `[music] startup audio warmup: ${
-          firstByteResult.ok
-            ? `${firstByteResult.elapsedMs} ms to first byte`
-            : firstByteResult.timeout
-              ? "timed out after 12000 ms"
-              : `ended after ${firstByteResult.elapsedMs} ms`
-        }`,
-      );
-    } catch (error) {
-      /*
-       * Warmup is purely an optimization. Never let it prevent the bot from
-       * starting or poison future real /play requests.
-       */
-      console.warn(
-        "[music] startup pipeline warmup failed; normal /play remains available:",
-        error.message,
-      );
-
-      if (!youtubePromise) {
-        youtubePromise = null;
-      }
-    } finally {
-      warmController?.stop();
-
-      console.log(
-        `[music] startup pipeline warmup finished in ${Math.round(
-          performance.now() - totalStartedAt,
-        )} ms`,
-      );
-    }
-  })();
-
-  return pipelineWarmupPromise;
-}
-
-/*
- * Do not await this. Discord login and the warmup run concurrently.
- */
-setImmediate(() => {
-  void warmPlaybackPipeline();
-});
-
 
 async function sendSessionMessage(session, payload) {
   try {
