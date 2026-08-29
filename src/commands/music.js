@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 
 const musicSessions = new Map();
 
-console.log("[music] Corri music engine v3.2 classic-search loaded");
+console.log("[music] Corri music engine v4 hybrid-optimized loaded");
 
 const IDLE_DISCONNECT_MS = 2 * 60 * 1000;
 const MAX_QUEUE_DISPLAY = 15;
@@ -66,6 +66,32 @@ function getYouTube() {
   }
 
   return youtubePromise;
+}
+
+function extractYouTubeVideoId(input) {
+  try {
+    const url = new URL(input);
+    const host = url.hostname.replace(/^www\./, "").toLowerCase();
+
+    if (host === "youtu.be") {
+      return url.pathname.split("/").filter(Boolean)[0] || null;
+    }
+
+    if (host === "youtube.com" || host.endsWith(".youtube.com")) {
+      if (url.pathname === "/watch") {
+        return url.searchParams.get("v");
+      }
+
+      const parts = url.pathname.split("/").filter(Boolean);
+      if (["shorts", "live", "embed"].includes(parts[0])) {
+        return parts[1] || null;
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
 }
 
 function normalizeQuery(input) {
@@ -127,73 +153,12 @@ function putCachedTrack(query, track) {
   trimTrackCache();
 }
 
-function searchVideoToTrack(video, query, requestedBy) {
-  const id = video?.id || video?.video_id || video?.endpoint?.payload?.videoId || null;
-  if (!id) return null;
-
-  const title =
-    video.title?.toString?.() ||
-    video.title?.text ||
-    String(video.title || query);
-
-  const author =
-    video.author?.name ||
-    video.author?.title?.toString?.() ||
-    video.author?.toString?.() ||
-    "Unknown channel";
-
-  const durationValue = Number(
-    video.duration?.seconds ??
-    video.duration?.text?.split(":").reduce((total, part) => total * 60 + Number(part), 0),
-  );
-  const duration = Number.isFinite(durationValue) && durationValue > 0 ? durationValue : null;
-  const thumbnail =
-    video.best_thumbnail?.url ||
-    video.thumbnails?.[0]?.url ||
-    `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
-  const url = `https://www.youtube.com/watch?v=${id}`;
-
-  return {
-    key: randomUUID(),
-    query,
-    target: url,
-    id,
-    title,
-    url,
-    author,
-    duration,
-    thumbnail,
-    requestedBy,
-    metadataResolved: true,
-  };
-}
-
-function basicInfoToTrack(info, videoId, query, requestedBy) {
-  const basic = info?.basic_info || {};
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
-  const durationValue = Number(basic.duration);
-  const duration = Number.isFinite(durationValue) && durationValue > 0 ? durationValue : null;
-
-  return {
-    key: randomUUID(),
-    query,
-    target: url,
-    id: videoId,
-    title: basic.title || "YouTube video",
-    url,
-    author: basic.author || basic.channel?.name || "Unknown channel",
-    duration,
-    thumbnail: basic.thumbnail?.[0]?.url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-    requestedBy,
-    metadataResolved: Boolean(basic.title),
-  };
-}
-
 async function resolveTrack(query, requestedBy) {
   const cleanQuery = normalizeQuery(query);
   const cached = getCachedTrack(cleanQuery, requestedBy);
 
   if (cached) {
+    cached.metadataReady = Promise.resolve(cached);
     console.log(`[music] resolver cache hit: ${cached.title}`);
     return cached;
   }
@@ -202,86 +167,102 @@ async function resolveTrack(query, requestedBy) {
   const youtube = await getYouTube();
 
   let videoId = extractYouTubeVideoId(cleanQuery);
+  let firstVideo = null;
 
   if (!videoId) {
     /*
-     * This is the same search strategy Corri used before the aggressive
-     * yt-dlp search optimization: YouTube.js chooses the normal YouTube
-     * search result, then Corri resolves that exact video.
+     * Keep the exact search strategy from Corri's last known-good build:
+     * ask YouTube.js for normal video results and pick the first result
+     * that exposes video_id. A modern `id` fallback is only used if the
+     * library changes shape; it does not alter the result order.
      */
-    const search = await youtube.search(cleanQuery, {
-      type: "video",
-    });
+    const search = await youtube.search(cleanQuery, { type: "video" });
 
-    const videos = Array.from(search.videos || []);
-    const firstVideo = videos[0];
+    firstVideo =
+      search.videos.find((video) => video?.video_id) ||
+      search.videos.find((video) => video?.id);
 
     if (!firstVideo) {
       return null;
     }
 
-    /*
-     * Older YouTube.js builds exposed `video_id`; newer builds may expose
-     * `id`. This fallback does not change ranking — it only reads the ID
-     * from the first result that YouTube.js already selected.
-     */
-    videoId =
-      firstVideo.video_id ||
-      firstVideo.id ||
-      firstVideo.endpoint?.payload?.videoId ||
-      null;
-
-    if (!videoId) {
-      console.warn(
-        `[music] First YouTube result did not expose a video ID for: ${cleanQuery}`,
-      );
-      return null;
-    }
+    videoId = firstVideo.video_id || firstVideo.id;
   }
 
-  /*
-   * Keep the old metadata flow too. It costs one extra YouTube request,
-   * but it gives reliable title/channel/duration/thumbnail before the
-   * queue message is sent.
-   */
-  const info = await youtube.getBasicInfo(videoId);
-  const basicInfo = info.basic_info;
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
 
-  if (!basicInfo?.title) {
-    return null;
-  }
-
-  const durationValue = Number(basicInfo.duration);
-
+  // Build a playable candidate immediately after search. This allows
+  // yt-dlp prefetch to start while getBasicInfo() resolves in parallel.
   const track = {
     key: randomUUID(),
     query: cleanQuery,
-    target: `https://www.youtube.com/watch?v=${videoId}`,
+    target: url,
     id: videoId,
-    title: basicInfo.title,
-    url: `https://www.youtube.com/watch?v=${videoId}`,
+    title:
+      firstVideo?.title?.toString?.() ||
+      firstVideo?.title?.text ||
+      cleanQuery,
+    url,
     author:
-      basicInfo.author ||
-      basicInfo.channel?.name ||
-      "Unknown channel",
-    duration:
-      Number.isFinite(durationValue) && durationValue > 0
-        ? durationValue
-        : null,
-    thumbnail:
-      basicInfo.thumbnail?.[0]?.url ||
-      `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+      firstVideo?.author?.name ||
+      firstVideo?.author?.toString?.() ||
+      "YouTube",
+    duration: Number(firstVideo?.duration?.seconds) || null,
+    thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
     requestedBy,
-    metadataResolved: true,
+    metadataResolved: false,
   };
 
-  putCachedTrack(cleanQuery, track);
-
   console.log(
-    `[music] classic YouTube search resolved in ${Math.round(
+    `[music] YouTube candidate resolved in ${Math.round(
       performance.now() - startedAt,
-    )} ms: ${track.title} — ${track.author}`,
+    )} ms: ${track.title} [${videoId}]`,
   );
+
+  track.metadataReady = (async () => {
+    try {
+      const metadataStartedAt = performance.now();
+      const info = await youtube.getBasicInfo(videoId);
+      const basicInfo = info.basic_info;
+
+      if (basicInfo?.title) {
+        track.title = basicInfo.title;
+        track.author =
+          basicInfo.author ||
+          basicInfo.channel?.name ||
+          track.author ||
+          "Unknown channel";
+
+        const durationValue = Number(basicInfo.duration);
+        track.duration =
+          Number.isFinite(durationValue) && durationValue > 0
+            ? durationValue
+            : track.duration;
+
+        track.thumbnail =
+          basicInfo.thumbnail?.[0]?.url ||
+          `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+        track.metadataResolved = true;
+
+        putCachedTrack(cleanQuery, track);
+
+        console.log(
+          `[music] metadata ready in ${Math.round(
+            performance.now() - metadataStartedAt,
+          )} ms: ${track.title}`,
+        );
+      }
+    } catch (error) {
+      // Metadata failure must never turn a valid search result into
+      // "video not found". The exact URL can still be streamed by yt-dlp.
+      console.warn(
+        `[music] metadata lookup failed for ${videoId}; continuing with search metadata:`,
+        error.message,
+      );
+    }
+
+    return track;
+  })();
 
   return track;
 }
@@ -595,10 +576,15 @@ function playNext(session) {
     // Prepare the effective next track immediately.
     schedulePrefetch(session);
 
-    // Metadata was resolved before the track entered the queue.
-    void sendSessionMessage(session, {
-      embeds: [buildTrackEmbed(nextTrack, "Now Playing")],
-    });
+    // Audio starts immediately. The message waits for metadata in parallel
+    // so the embed shows the real title/channel/duration when available.
+    void Promise.resolve(nextTrack.metadataReady)
+      .catch(() => nextTrack)
+      .then(() =>
+        sendSessionMessage(session, {
+          embeds: [buildTrackEmbed(nextTrack, "Now Playing")],
+        }),
+      );
 
     return true;
   } catch (error) {
@@ -781,6 +767,7 @@ async function getSessionForControl(interaction) {
 export async function handlePlayCommand(interaction) {
   const commandStartedAt = performance.now();
 
+  // Discord must be acknowledged before any network/process work.
   try {
     await interaction.deferReply();
   } catch (error) {
@@ -814,26 +801,31 @@ export async function handlePlayCommand(interaction) {
 
   let session = musicSessions.get(interaction.guildId);
   if (session && session.voiceChannelId !== voiceChannel.id) {
-    await safeEditReply(interaction, "I am already playing music in another voice channel.");
+    await safeEditReply(
+      interaction,
+      "I am already playing music in another voice channel.",
+    );
     return;
   }
 
-  // Begin Discord voice negotiation while YouTube search/metadata resolves.
+  // Start Discord voice negotiation while YouTube search is running.
   const createdNewSession = !session;
-  if (!session) session = createMusicSession(interaction, voiceChannel);
+  if (!session) {
+    session = createMusicSession(interaction, voiceChannel);
+  }
   session.textChannel = interaction.channel;
 
   let track;
   try {
     track = await resolveTrack(query, interaction.user.id);
   } catch (resolveError) {
-    console.error("[music] YouTube resolve failed:", resolveError);
+    console.error("[music] YouTube search failed:", resolveError);
 
     if (createdNewSession && !session.current && session.queue.length === 0) {
       destroySession(interaction.guildId);
     }
 
-    await safeEditReply(interaction, "I could not find that video on YouTube.");
+    await safeEditReply(interaction, "I could not search YouTube.");
     return;
   }
 
@@ -855,6 +847,11 @@ export async function handlePlayCommand(interaction) {
   let unownedController = null;
 
   try {
+    /*
+     * Start yt-dlp as soon as the exact video ID is known. getBasicInfo()
+     * continues in track.metadataReady, so metadata latency is hidden behind
+     * audio extraction instead of being paid before it.
+     */
     if (
       shouldStartNow ||
       (session.current && session.queue.length === 0 && session.loopMode !== "track")
@@ -862,7 +859,9 @@ export async function handlePlayCommand(interaction) {
       unownedController = createTrackStream(track, { prefetch: true });
     }
 
-    if (shouldStartNow) session.commandStartedAt = commandStartedAt;
+    if (shouldStartNow) {
+      session.commandStartedAt = commandStartedAt;
+    }
 
     session.queue.push(track);
 
@@ -874,10 +873,15 @@ export async function handlePlayCommand(interaction) {
 
     if (shouldStartNow) {
       const started = playNext(session);
+
       if (!started) {
         await safeEditReply(interaction, "I could not start the audio stream.");
         return;
       }
+
+      // Do not delay playback, but wait for metadata before rendering the
+      // command response so title/channel/duration are correct.
+      await Promise.resolve(track.metadataReady).catch(() => track);
 
       await safeEditReply(interaction, {
         embeds: [buildTrackEmbed(track, "Added to Player")],
@@ -885,9 +889,13 @@ export async function handlePlayCommand(interaction) {
       return;
     }
 
+    // The first waiting track starts prefetch immediately. If a controller
+    // was already created above, schedulePrefetch sees it and does no work.
     if (session.queue.length === 1 && !session.prefetched) {
       schedulePrefetch(session);
     }
+
+    await Promise.resolve(track.metadataReady).catch(() => track);
 
     await safeEditReply(interaction, {
       embeds: [
