@@ -8,123 +8,235 @@ import {
   entersState,
   joinVoiceChannel,
 } from "@discordjs/voice";
-import { EmbedBuilder, MessageFlags, PermissionFlagsBits } from "discord.js";
-import { Innertube, UniversalCache } from "youtubei.js";
+
+import {
+  EmbedBuilder,
+  MessageFlags,
+  PermissionFlagsBits,
+} from "discord.js";
+
+import {
+  Innertube,
+  UniversalCache,
+} from "youtubei.js";
+
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { PassThrough, Readable } from "node:stream";
+import {
+  PassThrough,
+  Readable,
+} from "node:stream";
 import { fileURLToPath } from "node:url";
 
 const musicSessions = new Map();
 
-console.log("[music] Corri music engine v7 native-first loaded");
-
-const IDLE_DISCONNECT_MS = 2 * 60 * 1000;
-const MAX_QUEUE_DISPLAY = 15;
-const PREFETCH_BUFFER_BYTES = 512 * 1024;
-const TRACK_CACHE_TTL_MS = 30 * 60 * 1000;
-const TRACK_CACHE_MAX = 100;
-const SOURCE_BUFFER_BYTES = 512 * 1024;
-const DIRECT_URL_CACHE_TTL_MS = 10 * 60 * 1000;
-const SOURCE_FIRST_BYTE_TIMEOUT_MS = 8_000;
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const YT_DLP_BINARY = path.resolve(
-  __dirname,
-  "../../node_modules/youtube-dl-exec/bin",
-  process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp",
+console.log(
+  "[music] Corri music engine v8 yt-dlp-deno loaded",
 );
 
-const CACHE_ROOT = path.resolve(__dirname, "../../.cache");
-const YT_DLP_CACHE_DIR = path.join(CACHE_ROOT, "yt-dlp");
-const YTJS_CACHE_DIR = path.join(CACHE_ROOT, "youtubejs");
+const IDLE_DISCONNECT_MS =
+  2 * 60 * 1000;
 
-fs.mkdirSync(YT_DLP_CACHE_DIR, { recursive: true });
-fs.mkdirSync(YTJS_CACHE_DIR, { recursive: true });
+const MAX_QUEUE_DISPLAY = 15;
 
-const YTJS_CACHE = new UniversalCache(true, YTJS_CACHE_DIR);
+const PREFETCH_BUFFER_BYTES =
+  512 * 1024;
+
+const TRACK_CACHE_TTL_MS =
+  30 * 60 * 1000;
+
+const TRACK_CACHE_MAX = 100;
+
+const SOURCE_BUFFER_BYTES =
+  512 * 1024;
+
+const DIRECT_URL_CACHE_TTL_MS =
+  10 * 60 * 1000;
+
+const SOURCE_FIRST_BYTE_TIMEOUT_MS =
+  8_000;
+
+const HTTP_RANGE_CHUNK_BYTES =
+  8 * 1024 * 1024;
+
+const HTTP_RANGE_RETRIES = 3;
+
+const __filename =
+  fileURLToPath(import.meta.url);
+
+const __dirname =
+  path.dirname(__filename);
+
+const YT_DLP_BINARY =
+  path.resolve(
+    __dirname,
+    "../../node_modules/youtube-dl-exec/bin",
+    process.platform === "win32"
+      ? "yt-dlp.exe"
+      : "yt-dlp",
+  );
+
+const CACHE_ROOT =
+  path.resolve(
+    __dirname,
+    "../../.cache",
+  );
+
+const YT_DLP_CACHE_DIR =
+  path.join(
+    CACHE_ROOT,
+    "yt-dlp",
+  );
+
+const YTJS_CACHE_DIR =
+  path.join(
+    CACHE_ROOT,
+    "youtubejs",
+  );
+
+fs.mkdirSync(
+  YT_DLP_CACHE_DIR,
+  {
+    recursive: true,
+  },
+);
+
+fs.mkdirSync(
+  YTJS_CACHE_DIR,
+  {
+    recursive: true,
+  },
+);
+
+const YTJS_CACHE =
+  new UniversalCache(
+    true,
+    YTJS_CACHE_DIR,
+  );
 
 const FORMAT_SELECTOR =
   "251/250/249/bestaudio[ext=webm][acodec=opus]/bestaudio[ext=webm]";
 
-const SAFE_YOUTUBE_EXTRACTOR_ARGS =
+const YOUTUBE_EXTRACTOR_ARGS =
   "youtube:skip=hls,dash,translated_subs";
 
 let youtubePromise = null;
 
-const trackCache = new Map();
-const directAudioUrlCache = new Map();
+const trackCache =
+  new Map();
+
+const directAudioUrlCache =
+  new Map();
 
 function getYouTube() {
   if (!youtubePromise) {
-    const startedAt = performance.now();
+    const startedAt =
+      performance.now();
 
-    youtubePromise = Innertube.create({
-      cache: YTJS_CACHE,
-    })
-      .then((youtube) => {
-        console.log(
-          `[music] YouTube.js session ready in ${Math.round(
-            performance.now() - startedAt,
-          )} ms`,
-        );
-
-        return youtube;
+    youtubePromise =
+      Innertube.create({
+        cache: YTJS_CACHE,
       })
-      .catch((error) => {
-        youtubePromise = null;
-        throw error;
-      });
+        .then(
+          (youtube) => {
+            console.log(
+              `[music] YouTube.js session ready in ${Math.round(
+                performance.now() -
+                  startedAt,
+              )} ms`,
+            );
+
+            return youtube;
+          },
+        )
+        .catch(
+          (error) => {
+            youtubePromise =
+              null;
+
+            throw error;
+          },
+        );
   }
 
   return youtubePromise;
 }
 
 setImmediate(() => {
-  void getYouTube().catch((error) => {
-    console.warn(
-      "[music] YouTube.js startup initialization failed; /play will retry:",
-      error.message,
-    );
-  });
+  void getYouTube().catch(
+    (error) => {
+      console.warn(
+        "[music] YouTube.js startup initialization failed; /play will retry:",
+        error.message,
+      );
+    },
+  );
 });
 
-function extractYouTubeVideoId(input) {
+function extractYouTubeVideoId(
+  input,
+) {
   try {
-    const url = new URL(input);
+    const url =
+      new URL(input);
 
-    const host = url.hostname
-      .replace(/^www\./, "")
-      .toLowerCase();
+    const host =
+      url.hostname
+        .replace(
+          /^www\./,
+          "",
+        )
+        .toLowerCase();
 
-    if (host === "youtu.be") {
-      return url.pathname
-        .split("/")
-        .filter(Boolean)[0] || null;
+    if (
+      host === "youtu.be"
+    ) {
+      return (
+        url.pathname
+          .split("/")
+          .filter(Boolean)[0] ||
+        null
+      );
     }
 
     if (
-      host === "youtube.com" ||
-      host.endsWith(".youtube.com")
+      host ===
+        "youtube.com" ||
+      host.endsWith(
+        ".youtube.com",
+      )
     ) {
-      if (url.pathname === "/watch") {
-        return url.searchParams.get("v");
+      if (
+        url.pathname ===
+        "/watch"
+      ) {
+        return url.searchParams.get(
+          "v",
+        );
       }
 
-      const parts = url.pathname
-        .split("/")
-        .filter(Boolean);
+      const parts =
+        url.pathname
+          .split("/")
+          .filter(Boolean);
 
       if (
-        ["shorts", "live", "embed"].includes(parts[0])
+        [
+          "shorts",
+          "live",
+          "embed",
+        ].includes(
+          parts[0],
+        )
       ) {
-        return parts[1] || null;
+        return (
+          parts[1] ||
+          null
+        );
       }
     }
   } catch {
@@ -134,94 +246,181 @@ function extractYouTubeVideoId(input) {
   return null;
 }
 
-function normalizeQuery(input) {
+function normalizeQuery(
+  input,
+) {
   return input
     .trim()
-    .replace(/\s+/g, " ");
+    .replace(
+      /\s+/g,
+      " ",
+    );
 }
 
-function cacheKeyForQuery(query) {
-  const videoId = extractYouTubeVideoId(query);
+function cacheKeyForQuery(
+  query,
+) {
+  const videoId =
+    extractYouTubeVideoId(
+      query,
+    );
 
   return videoId
     ? `video:${videoId}`
-    : `search:${query.toLocaleLowerCase("en-US")}`;
+    : `search:${query.toLocaleLowerCase(
+        "en-US",
+      )}`;
 }
 
 function trimTrackCache() {
-  while (trackCache.size > TRACK_CACHE_MAX) {
-    const oldestKey = trackCache
-      .keys()
-      .next()
-      .value;
+  while (
+    trackCache.size >
+    TRACK_CACHE_MAX
+  ) {
+    const oldestKey =
+      trackCache
+        .keys()
+        .next()
+        .value;
 
-    if (!oldestKey) break;
+    if (!oldestKey) {
+      break;
+    }
 
-    trackCache.delete(oldestKey);
+    trackCache.delete(
+      oldestKey,
+    );
   }
 }
 
-function getCachedTrack(query, requestedBy) {
-  const key = cacheKeyForQuery(query);
-  const cached = trackCache.get(key);
+function getCachedTrack(
+  query,
+  requestedBy,
+) {
+  const key =
+    cacheKeyForQuery(
+      query,
+    );
 
-  if (!cached) return null;
+  const cached =
+    trackCache.get(
+      key,
+    );
 
-  if (
-    Date.now() - cached.cachedAt >
-    TRACK_CACHE_TTL_MS
-  ) {
-    trackCache.delete(key);
+  if (!cached) {
     return null;
   }
 
-  trackCache.delete(key);
-  trackCache.set(key, cached);
+  if (
+    Date.now() -
+      cached.cachedAt >
+    TRACK_CACHE_TTL_MS
+  ) {
+    trackCache.delete(
+      key,
+    );
+
+    return null;
+  }
+
+  trackCache.delete(
+    key,
+  );
+
+  trackCache.set(
+    key,
+    cached,
+  );
 
   return {
     ...cached.track,
-    mediaInfo: cached.mediaInfo || null,
+
+    mediaInfo:
+      cached.mediaInfo ||
+      null,
+
     key: randomUUID(),
+
     query,
+
     requestedBy,
   };
 }
 
-function putCachedTrack(query, track) {
-  const key = cacheKeyForQuery(query);
+function putCachedTrack(
+  query,
+  track,
+) {
+  const key =
+    cacheKeyForQuery(
+      query,
+    );
 
-  trackCache.delete(key);
+  trackCache.delete(
+    key,
+  );
 
-  trackCache.set(key, {
-    cachedAt: Date.now(),
+  trackCache.set(
+    key,
+    {
+      cachedAt:
+        Date.now(),
 
-    mediaInfo: track.mediaInfo || null,
+      mediaInfo:
+        track.mediaInfo ||
+        null,
 
-    track: {
-      target: track.target,
-      id: track.id,
-      title: track.title,
-      url: track.url,
-      author: track.author,
-      duration: track.duration,
-      thumbnail: track.thumbnail,
-      metadataResolved: true,
+      track: {
+        target:
+          track.target,
+
+        id:
+          track.id,
+
+        title:
+          track.title,
+
+        url:
+          track.url,
+
+        author:
+          track.author,
+
+        duration:
+          track.duration,
+
+        thumbnail:
+          track.thumbnail,
+
+        metadataResolved:
+          true,
+      },
     },
-  });
+  );
 
   trimTrackCache();
 }
 
-async function resolveTrack(query, requestedBy) {
-  const cleanQuery = normalizeQuery(query);
+async function resolveTrack(
+  query,
+  requestedBy,
+) {
+  const cleanQuery =
+    normalizeQuery(
+      query,
+    );
 
-  const cached = getCachedTrack(
-    cleanQuery,
-    requestedBy,
-  );
+  const cached =
+    getCachedTrack(
+      cleanQuery,
+      requestedBy,
+    );
 
   if (cached) {
-    cached.metadataReady = Promise.resolve(cached);
+    cached.metadataReady =
+      Promise.resolve(
+        cached,
+      );
 
     console.log(
       `[music] resolver cache hit: ${cached.title}`,
@@ -230,32 +429,41 @@ async function resolveTrack(query, requestedBy) {
     return cached;
   }
 
-  const startedAt = performance.now();
+  const startedAt =
+    performance.now();
 
-  const youtube = await getYouTube();
+  const youtube =
+    await getYouTube();
 
   let videoId =
-    extractYouTubeVideoId(cleanQuery);
+    extractYouTubeVideoId(
+      cleanQuery,
+    );
 
-  let firstVideo = null;
+  let firstVideo =
+    null;
 
   if (!videoId) {
-    const search = await youtube.search(
-      cleanQuery,
-      {
-        type: "video",
-      },
-    );
+    const search =
+      await youtube.search(
+        cleanQuery,
+        {
+          type: "video",
+        },
+      );
 
-    const videos = Array.from(
-      search.videos || [],
-    );
+    const videos =
+      Array.from(
+        search.videos ||
+          [],
+      );
 
-    firstVideo = videos.find(
-      (video) =>
-        video?.video_id ||
-        video?.id,
-    );
+    firstVideo =
+      videos.find(
+        (video) =>
+          video?.video_id ||
+          video?.id,
+      );
 
     if (!firstVideo) {
       return null;
@@ -267,9 +475,15 @@ async function resolveTrack(query, requestedBy) {
 
     console.log(
       `[music] search "${cleanQuery}" first candidates: ${videos
-        .slice(0, 3)
+        .slice(
+          0,
+          3,
+        )
         .map(
-          (video, index) =>
+          (
+            video,
+            index,
+          ) =>
             `${index + 1}. ${
               video?.title?.toString?.() ||
               video?.title?.text ||
@@ -280,7 +494,9 @@ async function resolveTrack(query, requestedBy) {
               "no-id"
             }]`,
         )
-        .join(" | ")}`,
+        .join(
+          " | ",
+        )}`,
     );
   }
 
@@ -288,13 +504,17 @@ async function resolveTrack(query, requestedBy) {
     `https://www.youtube.com/watch?v=${videoId}`;
 
   const track = {
-    key: randomUUID(),
+    key:
+      randomUUID(),
 
-    query: cleanQuery,
+    query:
+      cleanQuery,
 
-    target: url,
+    target:
+      url,
 
-    id: videoId,
+    id:
+      videoId,
 
     title:
       firstVideo?.title?.toString?.() ||
@@ -304,13 +524,16 @@ async function resolveTrack(query, requestedBy) {
     url,
 
     author:
-      firstVideo?.author?.name ||
+      firstVideo?.author
+        ?.name ||
       firstVideo?.author?.toString?.() ||
       "YouTube",
 
     duration:
       Number(
-        firstVideo?.duration?.seconds,
+        firstVideo
+          ?.duration
+          ?.seconds,
       ) || null,
 
     thumbnail:
@@ -318,83 +541,106 @@ async function resolveTrack(query, requestedBy) {
 
     requestedBy,
 
-    metadataResolved: false,
+    metadataResolved:
+      false,
 
-    mediaInfo: null,
+    mediaInfo:
+      null,
   };
 
   console.log(
     `[music] YouTube candidate resolved in ${Math.round(
-      performance.now() - startedAt,
+      performance.now() -
+        startedAt,
     )} ms: ${track.title} [${videoId}]`,
   );
 
-  track.metadataReady = (async () => {
-    try {
-      const metadataStartedAt =
-        performance.now();
+  track.metadataReady =
+    (async () => {
+      try {
+        const metadataStartedAt =
+          performance.now();
 
-      const info =
-        await youtube.getBasicInfo(videoId);
+        const info =
+          await youtube.getBasicInfo(
+            videoId,
+          );
 
-      const basicInfo = info.basic_info;
+        const basicInfo =
+          info.basic_info;
 
-      track.mediaInfo = info;
+        track.mediaInfo =
+          info;
 
-      if (basicInfo?.title) {
-        track.title = basicInfo.title;
+        if (
+          basicInfo?.title
+        ) {
+          track.title =
+            basicInfo.title;
 
-        track.author =
-          basicInfo.author ||
-          basicInfo.channel?.name ||
-          track.author ||
-          "Unknown channel";
+          track.author =
+            basicInfo.author ||
+            basicInfo.channel
+              ?.name ||
+            track.author ||
+            "Unknown channel";
 
-        const durationValue =
-          Number(basicInfo.duration);
+          const durationValue =
+            Number(
+              basicInfo.duration,
+            );
 
-        track.duration =
-          Number.isFinite(durationValue) &&
-          durationValue > 0
-            ? durationValue
-            : track.duration;
+          track.duration =
+            Number.isFinite(
+              durationValue,
+            ) &&
+            durationValue > 0
+              ? durationValue
+              : track.duration;
 
-        track.thumbnail =
-          basicInfo.thumbnail?.[0]?.url ||
-          `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+          track.thumbnail =
+            basicInfo.thumbnail?.[0]
+              ?.url ||
+            `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 
-        track.metadataResolved = true;
+          track.metadataResolved =
+            true;
 
-        putCachedTrack(
-          cleanQuery,
-          track,
-        );
+          putCachedTrack(
+            cleanQuery,
+            track,
+          );
 
-        console.log(
-          `[music] metadata ready in ${Math.round(
-            performance.now() -
-              metadataStartedAt,
-          )} ms: ${track.title}`,
+          console.log(
+            `[music] metadata ready in ${Math.round(
+              performance.now() -
+                metadataStartedAt,
+            )} ms: ${track.title}`,
+          );
+        }
+      } catch (error) {
+        console.warn(
+          `[music] metadata lookup failed for ${videoId}; continuing with search metadata:`,
+          error.message,
         );
       }
-    } catch (error) {
-      console.warn(
-        `[music] metadata lookup failed for ${videoId}; continuing with search metadata:`,
-        error.message,
-      );
-    }
 
-    return track;
-  })();
+      return track;
+    })();
 
   return track;
 }
 
-function formatDuration(seconds) {
-  const value = Number(seconds);
+function formatDuration(
+  seconds,
+) {
+  const value =
+    Number(seconds);
 
   if (
-    !Number.isFinite(value) ||
+    !Number.isFinite(
+      value,
+    ) ||
     value <= 0
   ) {
     return "Unknown";
@@ -404,27 +650,44 @@ function formatDuration(seconds) {
     Math.floor(value);
 
   const hours =
-    Math.floor(totalSeconds / 3600);
+    Math.floor(
+      totalSeconds /
+        3600,
+    );
 
   const minutes =
     Math.floor(
-      (totalSeconds % 3600) / 60,
+      (totalSeconds %
+        3600) /
+        60,
     );
 
   const remainingSeconds =
-    totalSeconds % 60;
+    totalSeconds %
+    60;
 
-  if (hours > 0) {
+  if (
+    hours > 0
+  ) {
     return `${hours}:${String(
       minutes,
-    ).padStart(2, "0")}:${String(
+    ).padStart(
+      2,
+      "0",
+    )}:${String(
       remainingSeconds,
-    ).padStart(2, "0")}`;
+    ).padStart(
+      2,
+      "0",
+    )}`;
   }
 
   return `${minutes}:${String(
     remainingSeconds,
-  ).padStart(2, "0")}`;
+  ).padStart(
+    2,
+    "0",
+  )}`;
 }
 
 function buildTrackEmbed(
@@ -432,43 +695,61 @@ function buildTrackEmbed(
   title,
   color = 0x2ecc71,
 ) {
-  const embed = new EmbedBuilder()
-    .setColor(color)
-    .setTitle(title)
-    .setDescription(
-      track.url
-        ? `[${track.title}](${track.url})`
-        : `**${track.title}**`,
-    )
-    .addFields(
-      {
-        name: "Channel",
-        value:
-          track.author ||
-          "Unknown",
-        inline: true,
-      },
-      {
-        name: "Duration",
-        value:
-          formatDuration(
-            track.duration,
-          ),
-        inline: true,
-      },
-      {
-        name: "Requested By",
-        value:
-          `<@${track.requestedBy}>`,
-        inline: true,
-      },
-    )
-    .setTimestamp()
-    .setFooter({
-      text: "Corri Music",
-    });
+  const embed =
+    new EmbedBuilder()
+      .setColor(color)
+      .setTitle(title)
+      .setDescription(
+        track.url
+          ? `[${track.title}](${track.url})`
+          : `**${track.title}**`,
+      )
+      .addFields(
+        {
+          name:
+            "Channel",
 
-  if (track.thumbnail) {
+          value:
+            track.author ||
+            "Unknown",
+
+          inline:
+            true,
+        },
+
+        {
+          name:
+            "Duration",
+
+          value:
+            formatDuration(
+              track.duration,
+            ),
+
+          inline:
+            true,
+        },
+
+        {
+          name:
+            "Requested By",
+
+          value:
+            `<@${track.requestedBy}>`,
+
+          inline:
+            true,
+        },
+      )
+      .setTimestamp()
+      .setFooter({
+        text:
+          "Corri Music",
+      });
+
+  if (
+    track.thumbnail
+  ) {
     embed.setThumbnail(
       track.thumbnail,
     );
@@ -498,9 +779,10 @@ function createTrackStream(
 
   const outputStream =
     new PassThrough({
-      highWaterMark: prefetch
-        ? PREFETCH_BUFFER_BYTES
-        : SOURCE_BUFFER_BYTES,
+      highWaterMark:
+        prefetch
+          ? PREFETCH_BUFFER_BYTES
+          : SOURCE_BUFFER_BYTES,
     });
 
   const lifecycle =
@@ -509,35 +791,57 @@ function createTrackStream(
   const children =
     new Set();
 
-  let stopped = false;
-  let lifecycleClosed = false;
-  let activeSource = null;
-  let activeFetchController = null;
-  let firstByteAt = null;
+  let stopped =
+    false;
+
+  let lifecycleClosed =
+    false;
+
+  let activeSource =
+    null;
+
+  let activeFetchController =
+    null;
+
+  let firstByteAt =
+    null;
+
   let resolveFirstByte;
 
   const firstBytePromise =
-    new Promise((resolve) => {
-      resolveFirstByte = resolve;
-    });
+    new Promise(
+      (resolve) => {
+        resolveFirstByte =
+          resolve;
+      },
+    );
 
   const settleFirstByte =
     (value) => {
-      if (!resolveFirstByte) {
+      if (
+        !resolveFirstByte
+      ) {
         return;
       }
 
-      resolveFirstByte(value);
-      resolveFirstByte = null;
+      resolveFirstByte(
+        value,
+      );
+
+      resolveFirstByte =
+        null;
     };
 
   const emitClose =
     (code) => {
-      if (lifecycleClosed) {
+      if (
+        lifecycleClosed
+      ) {
         return;
       }
 
-      lifecycleClosed = true;
+      lifecycleClosed =
+        true;
 
       lifecycle.emit(
         "close",
@@ -563,7 +867,9 @@ function createTrackStream(
       } catch {}
 
       try {
-        child.kill("SIGTERM");
+        child.kill(
+          "SIGTERM",
+        );
       } catch {}
     };
 
@@ -624,7 +930,10 @@ function createTrackStream(
       sourceStartedAt,
     ) =>
       new Promise(
-        (resolve, reject) => {
+        (
+          resolve,
+          reject,
+        ) => {
           if (stopped) {
             try {
               nodeStream.destroy();
@@ -650,7 +959,9 @@ function createTrackStream(
 
           const clearStartupTimer =
             () => {
-              if (startupTimer) {
+              if (
+                startupTimer
+              ) {
                 clearTimeout(
                   startupTimer,
                 );
@@ -669,7 +980,8 @@ function createTrackStream(
                 activeSource ===
                 nodeStream
               ) {
-                activeSource = null;
+                activeSource =
+                  null;
               }
 
               try {
@@ -679,34 +991,42 @@ function createTrackStream(
 
           const rejectBeforePlayback =
             (error) => {
-              if (startupSettled) {
+              if (
+                startupSettled
+              ) {
                 return;
               }
 
-              startupSettled = true;
+              startupSettled =
+                true;
 
               clearStartupTimer();
 
               detachFailedSource();
 
-              reject(error);
+              reject(
+                error,
+              );
             };
 
           const startupTimer =
-            setTimeout(() => {
-              if (
-                sawFirstByte ||
-                stopped
-              ) {
-                return;
-              }
+            setTimeout(
+              () => {
+                if (
+                  sawFirstByte ||
+                  stopped
+                ) {
+                  return;
+                }
 
-              rejectBeforePlayback(
-                new Error(
-                  `${sourceName} produced no audio within ${SOURCE_FIRST_BYTE_TIMEOUT_MS} ms`,
-                ),
-              );
-            }, SOURCE_FIRST_BYTE_TIMEOUT_MS);
+                rejectBeforePlayback(
+                  new Error(
+                    `${sourceName} produced no audio within ${SOURCE_FIRST_BYTE_TIMEOUT_MS} ms`,
+                  ),
+                );
+              },
+              SOURCE_FIRST_BYTE_TIMEOUT_MS,
+            );
 
           nodeStream.once(
             "data",
@@ -715,7 +1035,8 @@ function createTrackStream(
                 return;
               }
 
-              sawFirstByte = true;
+              sawFirstByte =
+                true;
 
               firstByteAt =
                 performance.now();
@@ -737,7 +1058,8 @@ function createTrackStream(
               );
 
               settleFirstByte({
-                ok: true,
+                ok:
+                  true,
 
                 elapsedMs:
                   totalElapsedMs,
@@ -749,7 +1071,8 @@ function createTrackStream(
               if (
                 !startupSettled
               ) {
-                startupSettled = true;
+                startupSettled =
+                  true;
 
                 clearStartupTimer();
 
@@ -765,7 +1088,9 @@ function createTrackStream(
                 return;
               }
 
-              if (!sawFirstByte) {
+              if (
+                !sawFirstByte
+              ) {
                 rejectBeforePlayback(
                   error,
                 );
@@ -782,7 +1107,9 @@ function createTrackStream(
                 error,
               );
 
-              emitClose(1);
+              emitClose(
+                1,
+              );
             },
           );
 
@@ -793,7 +1120,9 @@ function createTrackStream(
                 return;
               }
 
-              if (!sawFirstByte) {
+              if (
+                !sawFirstByte
+              ) {
                 rejectBeforePlayback(
                   new Error(
                     `${sourceName} ended before producing audio`,
@@ -807,12 +1136,15 @@ function createTrackStream(
                 activeSource ===
                 nodeStream
               ) {
-                activeSource = null;
+                activeSource =
+                  null;
               }
 
               outputStream.end();
 
-              emitClose(0);
+              emitClose(
+                0,
+              );
             },
           );
 
@@ -825,69 +1157,13 @@ function createTrackStream(
         },
       );
 
-  const openYouTubeJsStream =
-    async () => {
-      const nativeStartedAt =
-        performance.now();
-
-      await Promise.resolve(
-        track.metadataReady,
-      );
-
-      if (stopped) {
-        throw new Error(
-          "Stream stopped",
-        );
-      }
-
-      if (
-        !track.mediaInfo?.download
-      ) {
-        throw new Error(
-          "YouTube.js streaming data is unavailable",
-        );
-      }
-
-      console.log(
-        `[music] native YouTube.js audio start (${track.title})`,
-      );
-
-      const webStream =
-        await track.mediaInfo.download({
-          type: "audio",
-          quality: "best",
-          format: "webm",
-          codec: "opus",
-        });
-
-      if (stopped) {
-        try {
-          await webStream.cancel?.(
-            "Stream stopped",
-          );
-        } catch {}
-
-        throw new Error(
-          "Stream stopped",
-        );
-      }
-
-      const nodeStream =
-        Readable.fromWeb(
-          webStream,
-        );
-
-      await pipePlayableSource(
-        nodeStream,
-        "youtubejs-native",
-        nativeStartedAt,
-      );
-    };
-
   const resolveWithYtDlp =
     () =>
       new Promise(
-        (resolve, reject) => {
+        (
+          resolve,
+          reject,
+        ) => {
           if (stopped) {
             reject(
               new Error(
@@ -902,7 +1178,7 @@ function createTrackStream(
             performance.now();
 
           const name =
-            "yt-dlp-safe";
+            "yt-dlp-deno";
 
           const args = [
             "--get-url",
@@ -924,42 +1200,52 @@ function createTrackStream(
             YT_DLP_CACHE_DIR,
 
             "--js-runtimes",
-            `node:${process.execPath}`,
+            "deno",
+
+            "--remote-components",
+            "ejs:npm",
 
             "--extractor-retries",
             "1",
 
             "--socket-timeout",
-            "10",
+            "8",
 
             "--extractor-args",
-            SAFE_YOUTUBE_EXTRACTOR_ARGS,
+            YOUTUBE_EXTRACTOR_ARGS,
 
             track.target,
           ];
 
           console.log(
-            `[music] URL fallback resolve start: ${name} (${track.title})`,
+            `[music] URL resolve start: ${name} (${track.title})`,
           );
 
-          const child = spawn(
-            YT_DLP_BINARY,
-            args,
-            {
-              windowsHide: true,
+          const child =
+            spawn(
+              YT_DLP_BINARY,
+              args,
+              {
+                windowsHide:
+                  true,
 
-              stdio: [
-                "ignore",
-                "pipe",
-                "pipe",
-              ],
-            },
+                stdio: [
+                  "ignore",
+                  "pipe",
+                  "pipe",
+                ],
+              },
+            );
+
+          children.add(
+            child,
           );
 
-          children.add(child);
+          let stdout =
+            "";
 
-          let stdout = "";
-          let stderr = "";
+          let stderr =
+            "";
 
           child.stdout.on(
             "data",
@@ -973,7 +1259,8 @@ function createTrackStream(
               ) {
                 stdout =
                   stdout.slice(
-                    -64 * 1024,
+                    -64 *
+                      1024,
                   );
               }
             },
@@ -991,7 +1278,8 @@ function createTrackStream(
               ) {
                 stderr =
                   stderr.slice(
-                    -64 * 1024,
+                    -64 *
+                      1024,
                   );
               }
             },
@@ -1004,7 +1292,9 @@ function createTrackStream(
                 child,
               );
 
-              reject(error);
+              reject(
+                error,
+              );
             },
           );
 
@@ -1027,7 +1317,9 @@ function createTrackStream(
 
               const url =
                 stdout
-                  .split(/\r?\n/)
+                  .split(
+                    /\r?\n/,
+                  )
                   .map(
                     (line) =>
                       line.trim(),
@@ -1050,7 +1342,7 @@ function createTrackStream(
                 url
               ) {
                 console.log(
-                  `[music] URL fallback resolved in ${elapsedMs} ms (${track.title})`,
+                  `[music] URL resolved in ${elapsedMs} ms (${track.title})`,
                 );
 
                 resolve({
@@ -1068,9 +1360,15 @@ function createTrackStream(
               const lastErrorLine =
                 stderr
                   .trim()
-                  .split(/\r?\n/)
-                  .filter(Boolean)
-                  .at(-1);
+                  .split(
+                    /\r?\n/,
+                  )
+                  .filter(
+                    Boolean,
+                  )
+                  .at(
+                    -1,
+                  );
 
               reject(
                 new Error(
@@ -1106,44 +1404,274 @@ function createTrackStream(
       const fetchStartedAt =
         performance.now();
 
-      const response =
-        await fetch(url, {
-          redirect: "follow",
+      const resilientSource =
+        Readable.from(
+          (async function* readRanges() {
+            let offset =
+              0;
 
-          signal:
-            fetchController.signal,
+            let totalSize =
+              null;
 
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+            while (
+              !stopped &&
+              (
+                totalSize ===
+                  null ||
+                offset <
+                  totalSize
+              )
+            ) {
+              const rangeEnd =
+                totalSize ===
+                null
+                  ? offset +
+                    HTTP_RANGE_CHUNK_BYTES -
+                    1
+                  : Math.min(
+                      offset +
+                        HTTP_RANGE_CHUNK_BYTES -
+                        1,
+
+                      totalSize -
+                        1,
+                    );
+
+              let response =
+                null;
+
+              let lastError =
+                null;
+
+              for (
+                let attempt = 1;
+                attempt <=
+                HTTP_RANGE_RETRIES;
+                attempt += 1
+              ) {
+                if (stopped) {
+                  throw new Error(
+                    "Stream stopped",
+                  );
+                }
+
+                try {
+                  response =
+                    await fetch(
+                      url,
+                      {
+                        redirect:
+                          "follow",
+
+                        signal:
+                          fetchController.signal,
+
+                        headers: {
+                          "User-Agent":
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+
+                          Range:
+                            `bytes=${offset}-${rangeEnd}`,
+                        },
+                      },
+                    );
+
+                  if (
+                    response.status !==
+                      200 &&
+                    response.status !==
+                      206
+                  ) {
+                    throw new Error(
+                      `GoogleVideo returned HTTP ${response.status}`,
+                    );
+                  }
+
+                  if (
+                    !response.body
+                  ) {
+                    throw new Error(
+                      "GoogleVideo returned an empty response body",
+                    );
+                  }
+
+                  break;
+                } catch (
+                  error
+                ) {
+                  lastError =
+                    error;
+
+                  response =
+                    null;
+
+                  if (
+                    attempt <
+                      HTTP_RANGE_RETRIES &&
+                    !stopped
+                  ) {
+                    await new Promise(
+                      (
+                        resolve,
+                      ) =>
+                        setTimeout(
+                          resolve,
+                          150 *
+                            attempt,
+                        ),
+                    );
+                  }
+                }
+              }
+
+              if (
+                !response
+              ) {
+                throw (
+                  lastError ||
+                  new Error(
+                    "GoogleVideo request failed",
+                  )
+                );
+              }
+
+              const contentRange =
+                response.headers.get(
+                  "content-range",
+                );
+
+              if (
+                contentRange
+              ) {
+                const match =
+                  /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(
+                    contentRange,
+                  );
+
+                if (
+                  match &&
+                  match[3] !==
+                    "*"
+                ) {
+                  totalSize =
+                    Number(
+                      match[3],
+                    );
+                }
+              } else if (
+                response.status ===
+                200
+              ) {
+                const contentLength =
+                  Number(
+                    response.headers.get(
+                      "content-length",
+                    ),
+                  );
+
+                if (
+                  Number.isFinite(
+                    contentLength,
+                  ) &&
+                  contentLength >
+                    0
+                ) {
+                  totalSize =
+                    offset +
+                    contentLength;
+                }
+              }
+
+              let bytesThisRequest =
+                0;
+
+              try {
+                const bodyStream =
+                  Readable.fromWeb(
+                    response.body,
+                  );
+
+                for await (
+                  const chunk of bodyStream
+                ) {
+                  if (
+                    stopped
+                  ) {
+                    throw new Error(
+                      "Stream stopped",
+                    );
+                  }
+
+                  const buffer =
+                    Buffer.isBuffer(
+                      chunk,
+                    )
+                      ? chunk
+                      : Buffer.from(
+                          chunk,
+                        );
+
+                  bytesThisRequest +=
+                    buffer.length;
+
+                  offset +=
+                    buffer.length;
+
+                  yield buffer;
+                }
+              } catch (
+                error
+              ) {
+                if (stopped) {
+                  throw new Error(
+                    "Stream stopped",
+                  );
+                }
+
+                console.warn(
+                  `[music] HTTP audio range interrupted at byte ${offset}; resuming (${track.title}):`,
+                  error.message,
+                );
+
+                continue;
+              }
+
+              if (
+                response.status ===
+                200
+              ) {
+                break;
+              }
+
+              if (
+                bytesThisRequest ===
+                0
+              ) {
+                throw new Error(
+                  "GoogleVideo range request returned zero bytes",
+                );
+              }
+
+              if (
+                totalSize !==
+                  null &&
+                offset >=
+                  totalSize
+              ) {
+                break;
+              }
+            }
+          })(),
+
+          {
+            highWaterMark:
+              SOURCE_BUFFER_BYTES,
           },
-        });
-
-      if (
-        !response.ok ||
-        !response.body
-      ) {
-        throw new Error(
-          `GoogleVideo returned HTTP ${response.status}`,
-        );
-      }
-
-      if (stopped) {
-        fetchController.abort();
-
-        throw new Error(
-          "Stream stopped",
-        );
-      }
-
-      const nodeStream =
-        Readable.fromWeb(
-          response.body,
         );
 
       try {
         await pipePlayableSource(
-          nodeStream,
+          resilientSource,
           sourceName,
           fetchStartedAt,
         );
@@ -1164,7 +1692,9 @@ function createTrackStream(
         const cachedUrl =
           getCachedDirectUrl();
 
-        if (cachedUrl) {
+        if (
+          cachedUrl
+        ) {
           console.log(
             `[music] direct URL cache hit: ${track.title}`,
           );
@@ -1176,33 +1706,20 @@ function createTrackStream(
             );
 
             return;
-          } catch (error) {
+          } catch (
+            error
+          ) {
             if (stopped) {
               return;
             }
 
             console.warn(
-              `[music] cached direct URL rejected; trying native path (${track.title}):`,
+              `[music] cached direct URL rejected; resolving a fresh URL (${track.title}):`,
               error.message,
             );
 
             invalidateDirectUrl();
           }
-        }
-
-        try {
-          await openYouTubeJsStream();
-
-          return;
-        } catch (error) {
-          if (stopped) {
-            return;
-          }
-
-          console.warn(
-            `[music] native YouTube.js audio unavailable; using yt-dlp fallback (${track.title}):`,
-            error.message,
-          );
         }
 
         const resolved =
@@ -1223,7 +1740,9 @@ function createTrackStream(
           );
 
           return;
-        } catch (error) {
+        } catch (
+          error
+        ) {
           if (stopped) {
             return;
           }
@@ -1231,7 +1750,7 @@ function createTrackStream(
           invalidateDirectUrl();
 
           console.warn(
-            `[music] fresh fallback URL rejected; resolving once more (${track.title}):`,
+            `[music] fresh URL rejected; resolving once more (${track.title}):`,
             error.message,
           );
 
@@ -1251,7 +1770,9 @@ function createTrackStream(
             `${retry.source}-retry`,
           );
         }
-      } catch (error) {
+      } catch (
+        error
+      ) {
         if (stopped) {
           return;
         }
@@ -1262,7 +1783,8 @@ function createTrackStream(
         );
 
         settleFirstByte({
-          ok: false,
+          ok:
+            false,
 
           elapsedMs:
             Math.round(
@@ -1275,24 +1797,32 @@ function createTrackStream(
           error,
         );
 
-        emitClose(1);
+        emitClose(
+          1,
+        );
       }
     };
 
-  setImmediate(() => {
-    void startPipeline();
-  });
+  setImmediate(
+    () => {
+      void startPipeline();
+    },
+  );
 
   const controller = {
-    process: lifecycle,
+    process:
+      lifecycle,
 
-    stream: outputStream,
+    stream:
+      outputStream,
 
     track,
 
-    prefetched: prefetch,
+    prefetched:
+      prefetch,
 
-    stopped: false,
+    stopped:
+      false,
 
     startedAt,
 
@@ -1322,7 +1852,8 @@ function createTrackStream(
       controller.stopped =
         true;
 
-      stopped = true;
+      stopped =
+        true;
 
       try {
         activeFetchController?.abort();
@@ -1341,13 +1872,16 @@ function createTrackStream(
       for (
         const child of children
       ) {
-        stopChild(child);
+        stopChild(
+          child,
+        );
       }
 
       children.clear();
 
       settleFirstByte({
-        ok: false,
+        ok:
+          false,
 
         elapsedMs:
           Math.round(
@@ -1355,14 +1889,17 @@ function createTrackStream(
               startedAt,
           ),
 
-        stopped: true,
+        stopped:
+          true,
       });
 
       try {
         outputStream.end();
       } catch {}
 
-      emitClose(0);
+      emitClose(
+        0,
+      );
     },
   };
 
@@ -1411,28 +1948,38 @@ async function safeEditReply(
   }
 }
 
-function stopActiveStream(session) {
-  if (!session.activeStream) {
+function stopActiveStream(
+  session,
+) {
+  if (
+    !session.activeStream
+  ) {
     return;
   }
 
   const activeStream =
     session.activeStream;
 
-  session.activeStream = null;
+  session.activeStream =
+    null;
 
   activeStream.stop();
 }
 
-function stopPrefetchedStream(session) {
-  if (!session.prefetched) {
+function stopPrefetchedStream(
+  session,
+) {
+  if (
+    !session.prefetched
+  ) {
     return;
   }
 
   const prefetched =
     session.prefetched;
 
-  session.prefetched = null;
+  session.prefetched =
+    null;
 
   prefetched.controller.stop();
 }
@@ -1440,7 +1987,9 @@ function stopPrefetchedStream(session) {
 function getDesiredPrefetchTrack(
   session,
 ) {
-  if (!session.current) {
+  if (
+    !session.current
+  ) {
     return (
       session.queue[0] ||
       null
@@ -1455,7 +2004,8 @@ function getDesiredPrefetchTrack(
   }
 
   if (
-    session.queue.length > 0
+    session.queue.length >
+    0
   ) {
     return session.queue[0];
   }
@@ -1470,7 +2020,9 @@ function getDesiredPrefetchTrack(
   return null;
 }
 
-function refreshPrefetch(session) {
+function refreshPrefetch(
+  session,
+) {
   const desiredTrack =
     getDesiredPrefetchTrack(
       session,
@@ -1485,8 +2037,9 @@ function refreshPrefetch(session) {
   }
 
   if (
-    session.prefetched?.track
-      .key === desiredTrack.key
+    session.prefetched
+      ?.track.key ===
+    desiredTrack.key
   ) {
     return;
   }
@@ -1500,7 +2053,8 @@ function refreshPrefetch(session) {
       createTrackStream(
         desiredTrack,
         {
-          prefetch: true,
+          prefetch:
+            true,
         },
       );
 
@@ -1531,11 +2085,14 @@ function refreshPrefetch(session) {
       error.message,
     );
 
-    session.prefetched = null;
+    session.prefetched =
+      null;
   }
 }
 
-function schedulePrefetch(session) {
+function schedulePrefetch(
+  session,
+) {
   if (
     session.prefetchScheduled
   ) {
@@ -1545,12 +2102,16 @@ function schedulePrefetch(session) {
   session.prefetchScheduled =
     true;
 
-  setImmediate(() => {
-    session.prefetchScheduled =
-      false;
+  setImmediate(
+    () => {
+      session.prefetchScheduled =
+        false;
 
-    refreshPrefetch(session);
-  });
+      refreshPrefetch(
+        session,
+      );
+    },
+  );
 }
 
 function takeTrackStream(
@@ -1558,13 +2119,15 @@ function takeTrackStream(
   track,
 ) {
   if (
-    session.prefetched?.track
-      .key === track.key
+    session.prefetched
+      ?.track.key ===
+    track.key
   ) {
     const prefetched =
       session.prefetched;
 
-    session.prefetched = null;
+    session.prefetched =
+      null;
 
     console.log(
       `[music] using prefetched stream: ${track.title}`,
@@ -1578,23 +2141,31 @@ function takeTrackStream(
   );
 }
 
-function destroySession(guildId) {
+function destroySession(
+  guildId,
+) {
   const session =
-    musicSessions.get(guildId);
+    musicSessions.get(
+      guildId,
+    );
 
   if (!session) {
     return;
   }
 
-  if (session.idleTimer) {
+  if (
+    session.idleTimer
+  ) {
     clearTimeout(
       session.idleTimer,
     );
   }
 
-  session.queue.length = 0;
+  session.queue.length =
+    0;
 
-  session.current = null;
+  session.current =
+    null;
 
   session.skipRequested =
     false;
@@ -1608,7 +2179,9 @@ function destroySession(guildId) {
   );
 
   try {
-    session.player.stop(true);
+    session.player.stop(
+      true,
+    );
   } catch {}
 
   try {
@@ -1623,30 +2196,37 @@ function destroySession(guildId) {
 function scheduleIdleDisconnect(
   session,
 ) {
-  if (session.idleTimer) {
+  if (
+    session.idleTimer
+  ) {
     clearTimeout(
       session.idleTimer,
     );
   }
 
   session.idleTimer =
-    setTimeout(() => {
-      if (
-        !session.current &&
-        session.queue.length ===
-          0 &&
-        session.player.state
-          .status ===
-          AudioPlayerStatus.Idle
-      ) {
-        destroySession(
-          session.guildId,
-        );
-      }
-    }, IDLE_DISCONNECT_MS);
+    setTimeout(
+      () => {
+        if (
+          !session.current &&
+          session.queue.length ===
+            0 &&
+          session.player.state
+            .status ===
+            AudioPlayerStatus.Idle
+        ) {
+          destroySession(
+            session.guildId,
+          );
+        }
+      },
+      IDLE_DISCONNECT_MS,
+    );
 }
 
-function playNext(session) {
+function playNext(
+  session,
+) {
   if (
     session.isLoading ||
     session.current
@@ -1669,17 +2249,21 @@ function playNext(session) {
     return false;
   }
 
-  session.isLoading = true;
+  session.isLoading =
+    true;
 
   session.current =
     nextTrack;
 
-  if (session.idleTimer) {
+  if (
+    session.idleTimer
+  ) {
     clearTimeout(
       session.idleTimer,
     );
 
-    session.idleTimer = null;
+    session.idleTimer =
+      null;
   }
 
   try {
@@ -1732,20 +2316,22 @@ function playNext(session) {
       nextTrack.metadataReady,
     )
       .catch(
-        () => nextTrack,
+        () =>
+          nextTrack,
       )
-      .then(() =>
-        sendSessionMessage(
-          session,
-          {
-            embeds: [
-              buildTrackEmbed(
-                nextTrack,
-                "Now Playing",
-              ),
-            ],
-          },
-        ),
+      .then(
+        () =>
+          sendSessionMessage(
+            session,
+            {
+              embeds: [
+                buildTrackEmbed(
+                  nextTrack,
+                  "Now Playing",
+                ),
+              ],
+            },
+          ),
       );
 
     return true;
@@ -1759,7 +2345,8 @@ function playNext(session) {
       session,
     );
 
-    session.current = null;
+    session.current =
+      null;
 
     session.isLoading =
       false;
@@ -1794,7 +2381,8 @@ function createMusicSession(
         interaction.guild
           .voiceAdapterCreator,
 
-      selfDeaf: true,
+      selfDeaf:
+        true,
     });
 
   const player =
@@ -1825,22 +2413,29 @@ function createMusicSession(
 
     queue: [],
 
-    current: null,
+    current:
+      null,
 
-    activeStream: null,
+    activeStream:
+      null,
 
-    prefetched: null,
+    prefetched:
+      null,
 
     prefetchScheduled:
       false,
 
-    idleTimer: null,
+    idleTimer:
+      null,
 
-    isLoading: false,
+    isLoading:
+      false,
 
-    skipRequested: false,
+    skipRequested:
+      false,
 
-    loopMode: "off",
+    loopMode:
+      "off",
 
     commandStartedAt:
       null,
@@ -1878,7 +2473,9 @@ function createMusicSession(
   player.on(
     AudioPlayerStatus.Idle,
     () => {
-      if (!session.current) {
+      if (
+        !session.current
+      ) {
         return;
       }
 
@@ -1895,9 +2492,12 @@ function createMusicSession(
         session,
       );
 
-      session.current = null;
+      session.current =
+        null;
 
-      if (!wasSkipped) {
+      if (
+        !wasSkipped
+      ) {
         if (
           session.loopMode ===
           "track"
@@ -1915,7 +2515,9 @@ function createMusicSession(
         }
       }
 
-      playNext(session);
+      playNext(
+        session,
+      );
     },
   );
 
@@ -1934,12 +2536,15 @@ function createMusicSession(
         session,
       );
 
-      session.current = null;
+      session.current =
+        null;
 
       session.skipRequested =
         false;
 
-      if (failedTrack) {
+      if (
+        failedTrack
+      ) {
         void sendSessionMessage(
           session,
           {
@@ -1949,7 +2554,9 @@ function createMusicSession(
         );
       }
 
-      playNext(session);
+      playNext(
+        session,
+      );
     },
   );
 
@@ -1970,30 +2577,33 @@ function createMusicSession(
     VoiceConnectionStatus.Ready,
     20_000,
   )
-    .then(() =>
-      console.log(
-        "[music] voice connection ready",
-      ),
+    .then(
+      () =>
+        console.log(
+          "[music] voice connection ready",
+        ),
     )
-    .catch(() => {
-      if (
-        musicSessions.get(
-          interaction.guildId,
-        ) === session
-      ) {
-        void sendSessionMessage(
-          session,
-          {
-            content:
-              "Voice connection timed out.",
-          },
-        );
+    .catch(
+      () => {
+        if (
+          musicSessions.get(
+            interaction.guildId,
+          ) === session
+        ) {
+          void sendSessionMessage(
+            session,
+            {
+              content:
+                "Voice connection timed out.",
+            },
+          );
 
-        destroySession(
-          interaction.guildId,
-        );
-      }
-    });
+          destroySession(
+            interaction.guildId,
+          );
+        }
+      },
+    );
 
   connection.on(
     VoiceConnectionStatus.Disconnected,
@@ -2034,14 +2644,18 @@ async function getVoiceContext(
   let member =
     interaction.member;
 
-  if (!member?.voice) {
+  if (
+    !member?.voice
+  ) {
     member =
       interaction.guild.members.cache.get(
         interaction.user.id,
       );
   }
 
-  if (!member?.voice) {
+  if (
+    !member?.voice
+  ) {
     member =
       await interaction.guild.members.fetch(
         interaction.user.id,
@@ -2051,7 +2665,9 @@ async function getVoiceContext(
   const voiceChannel =
     member.voice.channel;
 
-  if (!voiceChannel) {
+  if (
+    !voiceChannel
+  ) {
     return {
       error:
         "You need to join a voice channel first.",
@@ -2185,7 +2801,8 @@ export async function handlePlayCommand(
   const {
     voiceChannel,
     error,
-  } = voiceContext;
+  } =
+    voiceContext;
 
   if (error) {
     await safeEditReply(
@@ -2236,7 +2853,9 @@ export async function handlePlayCommand(
         query,
         interaction.user.id,
       );
-  } catch (resolveError) {
+  } catch (
+    resolveError
+  ) {
     console.error(
       "[music] YouTube search failed:",
       resolveError,
@@ -2308,25 +2927,33 @@ export async function handlePlayCommand(
         createTrackStream(
           track,
           {
-            prefetch: true,
+            prefetch:
+              true,
           },
         );
     }
 
-    if (shouldStartNow) {
+    if (
+      shouldStartNow
+    ) {
       session.commandStartedAt =
         commandStartedAt;
     }
 
-    session.queue.push(track);
+    session.queue.push(
+      track,
+    );
 
-    if (unownedController) {
+    if (
+      unownedController
+    ) {
       stopPrefetchedStream(
         session,
       );
 
       session.prefetched = {
         track,
+
         controller:
           unownedController,
       };
@@ -2335,9 +2962,13 @@ export async function handlePlayCommand(
         null;
     }
 
-    if (shouldStartNow) {
+    if (
+      shouldStartNow
+    ) {
       const started =
-        playNext(session);
+        playNext(
+          session,
+        );
 
       if (!started) {
         await safeEditReply(
@@ -2400,12 +3031,15 @@ export async function handlePlayCommand(
             value:
               `${session.queue.length}`,
 
-            inline: true,
+            inline:
+              true,
           }),
         ],
       },
     );
-  } catch (playError) {
+  } catch (
+    playError
+  ) {
     unownedController?.stop();
 
     console.error(
@@ -2433,7 +3067,9 @@ export async function handleSkipCommand(
 
   if (error) {
     await interaction.reply({
-      content: error,
+      content:
+        error,
+
       flags:
         MessageFlags.Ephemeral,
     });
@@ -2441,7 +3077,9 @@ export async function handleSkipCommand(
     return;
   }
 
-  if (!session.current) {
+  if (
+    !session.current
+  ) {
     await interaction.reply({
       content:
         "There is no song playing right now.",
@@ -2457,8 +3095,8 @@ export async function handleSkipCommand(
     session.current;
 
   if (
-    session.prefetched?.track
-      .key ===
+    session.prefetched
+      ?.track.key ===
     skippedTrack.key
   ) {
     stopPrefetchedStream(
@@ -2476,7 +3114,9 @@ export async function handleSkipCommand(
     session,
   );
 
-  session.player.stop(true);
+  session.player.stop(
+    true,
+  );
 
   await interaction.reply(
     `⏭️ Skipped **${skippedTrack.title}**.`,
@@ -2495,7 +3135,9 @@ export async function handleStopCommand(
 
   if (error) {
     await interaction.reply({
-      content: error,
+      content:
+        error,
+
       flags:
         MessageFlags.Ephemeral,
     });
@@ -2525,7 +3167,8 @@ export async function handlePauseCommand(
 
   if (error) {
     await interaction.reply({
-      content: error,
+      content:
+        error,
 
       flags:
         MessageFlags.Ephemeral,
@@ -2582,7 +3225,8 @@ export async function handleResumeCommand(
 
   if (error) {
     await interaction.reply({
-      content: error,
+      content:
+        error,
 
       flags:
         MessageFlags.Ephemeral,
@@ -2654,7 +3298,9 @@ export async function handleQueueCommand(
 
   const parts = [];
 
-  if (session.current) {
+  if (
+    session.current
+  ) {
     parts.push(
       `**Now Playing**\n${
         session.current.url
@@ -2666,7 +3312,8 @@ export async function handleQueueCommand(
   }
 
   if (
-    session.queue.length > 0
+    session.queue.length >
+    0
   ) {
     const visibleQueue =
       session.queue.slice(
@@ -2686,10 +3333,14 @@ export async function handleQueueCommand(
                 ? `[${track.title}](${track.url})`
                 : track.title;
 
-            return `**${index + 1}.** ${label} — ${formatDuration(track.duration)}`;
+            return `**${index + 1}.** ${label} — ${formatDuration(
+              track.duration,
+            )}`;
           },
         )
-        .join("\n");
+        .join(
+          "\n",
+        );
 
     parts.push(
       `**Up Next**\n${queueText}`,
@@ -2700,7 +3351,10 @@ export async function handleQueueCommand(
       MAX_QUEUE_DISPLAY
     ) {
       parts.push(
-        `*...and ${session.queue.length - MAX_QUEUE_DISPLAY} more tracks.*`,
+        `*...and ${
+          session.queue.length -
+          MAX_QUEUE_DISPLAY
+        } more tracks.*`,
       );
     }
   } else {
@@ -2710,7 +3364,8 @@ export async function handleQueueCommand(
   }
 
   const loopLabels = {
-    off: "Off",
+    off:
+      "Off",
 
     track:
       "Current Track",
@@ -2728,18 +3383,22 @@ export async function handleQueueCommand(
         `Music Queue • ${session.queue.length} waiting`,
       )
       .setDescription(
-        parts.join("\n\n"),
+        parts.join(
+          "\n\n",
+        ),
       )
       .addFields(
         {
-          name: "Loop",
+          name:
+            "Loop",
 
           value:
             loopLabels[
               session.loopMode
             ],
 
-          inline: true,
+          inline:
+            true,
         },
 
         {
@@ -2751,7 +3410,8 @@ export async function handleQueueCommand(
               ? `Ready/Preparing: ${session.prefetched.track.title}`
               : "Idle",
 
-          inline: true,
+          inline:
+            true,
         },
       )
       .setFooter({
@@ -2760,7 +3420,9 @@ export async function handleQueueCommand(
       });
 
   await interaction.reply({
-    embeds: [embed],
+    embeds: [
+      embed,
+    ],
   });
 }
 
@@ -2772,7 +3434,9 @@ export async function handleNowPlayingCommand(
       interaction.guildId,
     );
 
-  if (!session?.current) {
+  if (
+    !session?.current
+  ) {
     await interaction.reply({
       content:
         "There is no song playing right now.",
@@ -2785,7 +3449,8 @@ export async function handleNowPlayingCommand(
   }
 
   const loopLabels = {
-    off: "Off",
+    off:
+      "Off",
 
     track:
       "Current Track",
@@ -2800,18 +3465,22 @@ export async function handleNowPlayingCommand(
       "Now Playing",
       0x9b59b6,
     ).addFields({
-      name: "Loop",
+      name:
+        "Loop",
 
       value:
         loopLabels[
           session.loopMode
         ],
 
-      inline: true,
+      inline:
+        true,
     });
 
   await interaction.reply({
-    embeds: [embed],
+    embeds: [
+      embed,
+    ],
   });
 }
 
@@ -2828,7 +3497,8 @@ export async function handleRemoveCommand(
 
   if (error) {
     await interaction.reply({
-      content: error,
+      content:
+        error,
 
       flags:
         MessageFlags.Ephemeral,
@@ -2859,7 +3529,8 @@ export async function handleRemoveCommand(
     );
 
   if (
-    position < 1 ||
+    position <
+      1 ||
     position >
       session.queue.length
   ) {
@@ -2874,7 +3545,9 @@ export async function handleRemoveCommand(
     return;
   }
 
-  const [removedTrack] =
+  const [
+    removedTrack,
+  ] =
     session.queue.splice(
       position - 1,
       1,
@@ -2902,7 +3575,8 @@ export async function handleShuffleCommand(
 
   if (error) {
     await interaction.reply({
-      content: error,
+      content:
+        error,
 
       flags:
         MessageFlags.Ephemeral,
@@ -2912,7 +3586,8 @@ export async function handleShuffleCommand(
   }
 
   if (
-    session.queue.length < 2
+    session.queue.length <
+    2
   ) {
     await interaction.reply({
       content:
@@ -2929,7 +3604,9 @@ export async function handleShuffleCommand(
     let i =
       session.queue.length -
       1;
+
     i > 0;
+
     i -= 1
   ) {
     const j =
@@ -2969,7 +3646,8 @@ export async function handleLoopCommand(
 
   if (error) {
     await interaction.reply({
-      content: error,
+      content:
+        error,
 
       flags:
         MessageFlags.Ephemeral,
@@ -2989,7 +3667,9 @@ export async function handleLoopCommand(
       "off",
       "track",
       "queue",
-    ].includes(mode)
+    ].includes(
+      mode,
+    )
   ) {
     await interaction.reply({
       content:
@@ -3002,7 +3682,8 @@ export async function handleLoopCommand(
     return;
   }
 
-  session.loopMode = mode;
+  session.loopMode =
+    mode;
 
   schedulePrefetch(
     session,
@@ -3020,7 +3701,9 @@ export async function handleLoopCommand(
   };
 
   await interaction.reply(
-    messages[mode],
+    messages[
+      mode
+    ],
   );
 }
 
@@ -3034,14 +3717,20 @@ setImmediate(() => {
   }
 
   try {
-    const warmup = spawn(
-      YT_DLP_BINARY,
-      ["--version"],
-      {
-        windowsHide: true,
-        stdio: "ignore",
-      },
-    );
+    const warmup =
+      spawn(
+        YT_DLP_BINARY,
+        [
+          "--version",
+        ],
+        {
+          windowsHide:
+            true,
+
+          stdio:
+            "ignore",
+        },
+      );
 
     warmup.unref();
   } catch {}
