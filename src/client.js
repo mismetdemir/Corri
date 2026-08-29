@@ -6,4 +6,9 @@ export const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildVoiceStates,
   ],
+
+  presence: {
+    status: "invisible",
+    activities: [],
+  },
 });

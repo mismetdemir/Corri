@@ -13,6 +13,7 @@ import { EmbedBuilder, PermissionFlagsBits } from "discord.js";
 import { Innertube } from "youtubei.js";
 
 import { spawn } from "node:child_process";
+import { PassThrough } from "node:stream";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +22,8 @@ const musicSessions = new Map();
 
 const IDLE_DISCONNECT_MS = 2 * 60 * 1000;
 const MAX_QUEUE_DISPLAY = 15;
+const PREFETCH_BUFFER_BYTES = 512 * 1024;
+const PREFETCH_DELAY_MS = 1200;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -199,6 +202,9 @@ async function resolveTrack(
 
 function createTrackStream(
   track,
+  {
+    prefetch = false,
+  } = {},
 ) {
   if (
     !fs.existsSync(
@@ -211,7 +217,7 @@ function createTrackStream(
   }
 
   console.log(
-    `Starting yt-dlp: ${track.url}`,
+    `${prefetch ? "Prefetching" : "Starting"} yt-dlp: ${track.url}`,
   );
 
   const args = [
@@ -228,14 +234,6 @@ function createTrackStream(
     "--no-warnings",
   ];
 
-  /*
-   * We spawn yt-dlp directly instead of
-   * using youtube-dl-exec's exec wrapper.
-   *
-   * This prevents the cmd.exe shell warning
-   * and gives us direct control over the
-   * process when /skip or /stop is used.
-   */
   const ytProcess = spawn(
     YT_DLP_BINARY,
     args,
@@ -256,6 +254,20 @@ function createTrackStream(
   let closed = false;
 
   let errorOutput = "";
+
+  const outputStream =
+    prefetch
+      ? new PassThrough({
+          highWaterMark:
+            PREFETCH_BUFFER_BYTES,
+        })
+      : ytProcess.stdout;
+
+  if (prefetch) {
+    ytProcess.stdout.pipe(
+      outputStream,
+    );
+  }
 
   ytProcess.stderr.on(
     "data",
@@ -321,7 +333,12 @@ function createTrackStream(
       ytProcess,
 
     stream:
-      ytProcess.stdout,
+      outputStream,
+
+    track,
+
+    prefetched:
+      prefetch,
 
     stopped:
       false,
@@ -345,15 +362,36 @@ function createTrackStream(
       );
 
       try {
-        ytProcess.stdout.destroy();
+        if (prefetch) {
+          ytProcess.stdout.unpipe(
+            outputStream,
+          );
+        }
+      } catch {
+        // Ignore.
+      }
+
+      try {
+        outputStream.destroy();
       } catch {
         // Stream may already be closed.
+      }
+
+      if (
+        outputStream !==
+        ytProcess.stdout
+      ) {
+        try {
+          ytProcess.stdout.destroy();
+        } catch {
+          // Ignore.
+        }
       }
 
       try {
         ytProcess.stderr.destroy();
       } catch {
-        // Stream may already be closed.
+        // Ignore.
       }
 
       try {
@@ -466,6 +504,195 @@ function stopActiveStream(
   activeStream.stop();
 }
 
+function stopPrefetchedStream(
+  session,
+) {
+  if (
+    session.prefetchTimer
+  ) {
+    clearTimeout(
+      session.prefetchTimer,
+    );
+
+    session.prefetchTimer =
+      null;
+  }
+
+  if (
+    !session.prefetched
+  ) {
+    return;
+  }
+
+  const prefetched =
+    session.prefetched;
+
+  session.prefetched =
+    null;
+
+  prefetched.controller.stop();
+}
+
+function getDesiredPrefetchTrack(
+  session,
+) {
+  if (
+    !session.current
+  ) {
+    return (
+      session.queue[0] ||
+      null
+    );
+  }
+
+  if (
+    session.loopMode ===
+    "track"
+  ) {
+    return session.current;
+  }
+
+  if (
+    session.queue.length >
+    0
+  ) {
+    return session.queue[0];
+  }
+
+  if (
+    session.loopMode ===
+    "queue"
+  ) {
+    return session.current;
+  }
+
+  return null;
+}
+
+function refreshPrefetch(
+  session,
+) {
+  const desiredTrack =
+    getDesiredPrefetchTrack(
+      session,
+    );
+
+  if (!desiredTrack) {
+    stopPrefetchedStream(
+      session,
+    );
+
+    return;
+  }
+
+  if (
+    session.prefetched
+      ?.track.id ===
+    desiredTrack.id
+  ) {
+    return;
+  }
+
+  stopPrefetchedStream(
+    session,
+  );
+
+  try {
+    const controller =
+      createTrackStream(
+        desiredTrack,
+        {
+          prefetch: true,
+        },
+      );
+
+    session.prefetched = {
+      track:
+        desiredTrack,
+
+      controller,
+    };
+
+    controller.process.once(
+      "close",
+      (code) => {
+        if (
+          code !== 0 &&
+          session.prefetched
+            ?.controller ===
+            controller
+        ) {
+          session.prefetched =
+            null;
+        }
+      },
+    );
+  } catch (error) {
+    console.error(
+      `Could not prefetch ${desiredTrack.title}:`,
+      error.message,
+    );
+
+    session.prefetched =
+      null;
+  }
+}
+
+function schedulePrefetch(
+  session,
+  delay =
+    PREFETCH_DELAY_MS,
+) {
+  if (
+    session.prefetchTimer
+  ) {
+    clearTimeout(
+      session.prefetchTimer,
+    );
+  }
+
+  session.prefetchTimer =
+    setTimeout(
+      () => {
+        session.prefetchTimer =
+          null;
+
+        refreshPrefetch(
+          session,
+        );
+      },
+
+      delay,
+    );
+}
+
+function takeTrackStream(
+  session,
+  track,
+) {
+  if (
+    session.prefetched
+      ?.track.id ===
+    track.id
+  ) {
+    const prefetched =
+      session.prefetched;
+
+    session.prefetched =
+      null;
+
+    console.log(
+      `Using prefetched stream: ${track.title}`,
+    );
+
+    return prefetched.controller;
+  }
+
+  return createTrackStream(
+    track,
+  );
+}
+
 function destroySession(
   guildId,
 ) {
@@ -497,6 +724,10 @@ function destroySession(
 
   session.skipRequested =
     false;
+
+  stopPrefetchedStream(
+    session,
+  );
 
   stopActiveStream(
     session,
@@ -572,6 +803,10 @@ async function playNext(
     session.queue.shift();
 
   if (!nextTrack) {
+    stopPrefetchedStream(
+      session,
+    );
+
     scheduleIdleDisconnect(
       session,
     );
@@ -605,22 +840,14 @@ async function playNext(
     );
 
     trackStream =
-      createTrackStream(
+      takeTrackStream(
+        session,
         nextTrack,
       );
 
     session.activeStream =
       trackStream;
 
-    /*
-     * Important:
-     *
-     * The stream is already WebM + Opus.
-     *
-     * No FFmpeg.
-     * No inlineVolume.
-     * No @discordjs/opus.
-     */
     const resource =
       createAudioResource(
         trackStream.stream,
@@ -652,6 +879,10 @@ async function playNext(
 
     console.log(
       `Player started: ${nextTrack.title}`,
+    );
+
+    schedulePrefetch(
+      session,
     );
 
     await sendSessionMessage(
@@ -780,6 +1011,12 @@ async function createMusicSession(
       null,
 
     activeStream:
+      null,
+
+    prefetched:
+      null,
+
+    prefetchTimer:
       null,
 
     idleTimer:
@@ -1195,6 +1432,16 @@ export async function handlePlayCommand(
     return;
   }
 
+  if (
+    session.queue.length ===
+    1
+  ) {
+    schedulePrefetch(
+      session,
+      250,
+    );
+  }
+
   await interaction.editReply({
     embeds: [
       buildTrackEmbed(
@@ -1255,9 +1502,16 @@ export async function handleSkipCommand(
   const skippedTrack =
     session.current;
 
-  /*
-   * Stop yt-dlp BEFORE stopping Discord player.
-   */
+  if (
+    session.prefetched
+      ?.track.id ===
+    skippedTrack.id
+  ) {
+    stopPrefetchedStream(
+      session,
+    );
+  }
+
   session.skipRequested =
     true;
 
@@ -1675,6 +1929,11 @@ export async function handleRemoveCommand(
       1,
     );
 
+  schedulePrefetch(
+    session,
+    100,
+  );
+
   await interaction.reply(
     `🗑️ Removed **${removedTrack.title}** from the queue.`,
   );
@@ -1742,6 +2001,11 @@ export async function handleShuffleCommand(
     ];
   }
 
+  schedulePrefetch(
+    session,
+    100,
+  );
+
   await interaction.reply(
     `🔀 Shuffled **${session.queue.length}** queued tracks.`,
   );
@@ -1797,6 +2061,11 @@ export async function handleLoopCommand(
 
   session.loopMode =
     mode;
+
+  schedulePrefetch(
+    session,
+    100,
+  );
 
   const messages = {
     off:
