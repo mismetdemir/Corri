@@ -8,7 +8,7 @@ import {
   entersState,
   joinVoiceChannel,
 } from "@discordjs/voice";
-import { EmbedBuilder, PermissionFlagsBits } from "discord.js";
+import { EmbedBuilder, MessageFlags, PermissionFlagsBits } from "discord.js";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -368,6 +368,19 @@ async function sendSessionMessage(session, payload) {
   }
 }
 
+async function safeEditReply(interaction, payload) {
+  try {
+    await interaction.editReply(payload);
+    return true;
+  } catch (error) {
+    console.error(
+      `[music] Could not edit interaction reply (${error.code ?? "unknown"}):`,
+      error.message,
+    );
+    return false;
+  }
+}
+
 function stopActiveStream(session) {
   if (!session.activeStream) return;
   const activeStream = session.activeStream;
@@ -705,31 +718,59 @@ async function getSessionForControl(interaction) {
 
 export async function handlePlayCommand(interaction) {
   const commandStartedAt = performance.now();
-  const deferPromise = interaction.deferReply();
 
-  const query = interaction.options.getString("query", true).trim();
-  const { voiceChannel, error } = await getVoiceContext(interaction);
-
-  if (error) {
-    await deferPromise;
-    await interaction.editReply(error);
+  /*
+   * Discord requires the initial interaction acknowledgement very quickly.
+   * Do this BEFORE spawning yt-dlp, touching the voice connection, or doing
+   * any other potentially expensive work. On a throttled free host this is
+   * especially important.
+   */
+  try {
+    await interaction.deferReply();
+  } catch (error) {
+    console.error(
+      `[music] Failed to acknowledge /play (${error.code ?? "unknown"}):`,
+      error.message,
+    );
     return;
   }
 
+  const query = interaction.options.getString("query", true).trim();
+
   if (!query) {
-    await deferPromise;
-    await interaction.editReply("Enter a YouTube URL or search query.");
+    await safeEditReply(interaction, "Enter a YouTube URL or search query.");
+    return;
+  }
+
+  let voiceContext;
+
+  try {
+    voiceContext = await getVoiceContext(interaction);
+  } catch (error) {
+    console.error("[music] Voice context lookup failed:", error);
+    await safeEditReply(interaction, "I could not read your voice channel.");
+    return;
+  }
+
+  const { voiceChannel, error } = voiceContext;
+
+  if (error) {
+    await safeEditReply(interaction, error);
     return;
   }
 
   let session = musicSessions.get(interaction.guildId);
 
   if (session && session.voiceChannelId !== voiceChannel.id) {
-    await interaction.editReply("I am already playing music in another voice channel.");
+    await safeEditReply(
+      interaction,
+      "I am already playing music in another voice channel.",
+    );
     return;
   }
 
   const track = createTrack(query, interaction.user.id);
+
   const shouldStartNow =
     !session ||
     (!session.current &&
@@ -737,11 +778,19 @@ export async function handlePlayCommand(interaction) {
       session.player.state.status === AudioPlayerStatus.Idle &&
       session.queue.length === 0);
 
-  let preparedController = null;
+  /*
+   * This variable represents a controller that is still owned by THIS
+   * function. As soon as we hand it to the session, it is set to null.
+   * Therefore an interaction/API error can never accidentally destroy an
+   * already-playing audio stream.
+   */
+  let unownedController = null;
 
   try {
-    // Start yt-dlp BEFORE doing any voice-ready wait or YouTube metadata lookup.
-    // For the first song this makes yt-dlp and Discord voice connection run in parallel.
+    /*
+     * Start yt-dlp as early as possible. For the first song, yt-dlp and the
+     * Discord voice handshake then progress in parallel.
+     */
     if (
       shouldStartNow ||
       (session &&
@@ -749,45 +798,65 @@ export async function handlePlayCommand(interaction) {
         session.queue.length === 0 &&
         session.loopMode !== "track")
     ) {
-      preparedController = createTrackStream(track, { prefetch: true });
+      unownedController = createTrackStream(track, { prefetch: true });
     }
 
-    if (!session) session = createMusicSession(interaction, voiceChannel);
+    if (!session) {
+      session = createMusicSession(interaction, voiceChannel);
+    }
+
     session.textChannel = interaction.channel;
 
-    if (shouldStartNow) session.commandStartedAt = commandStartedAt;
+    if (shouldStartNow) {
+      session.commandStartedAt = commandStartedAt;
+    }
 
     session.queue.push(track);
 
-    if (preparedController) {
-      // This is either the track that is about to start, or the first waiting track.
+    if (unownedController) {
       stopPrefetchedStream(session);
-      session.prefetched = { track, controller: preparedController };
+
+      session.prefetched = {
+        track,
+        controller: unownedController,
+      };
+
+      /*
+       * Ownership has moved to the music session. Never stop this controller
+       * from the command handler's catch block after this point.
+       */
+      unownedController = null;
     }
 
     if (shouldStartNow) {
       const started = playNext(session);
-      await deferPromise;
 
       if (!started) {
-        await interaction.editReply("I could not start the audio stream.");
+        await safeEditReply(interaction, "I could not start the audio stream.");
         return;
       }
 
-      // Give the same streaming process a brief chance to supply real metadata.
-      await waitForMetadata(session.activeStream, 750);
-
-      await interaction.editReply({
+      /*
+       * Do not block the slash-command response waiting for metadata.
+       * playNext() resolves metadata independently and sends the richer
+       * Now Playing embed when it becomes available.
+       */
+      await safeEditReply(interaction, {
         embeds: [buildTrackEmbed(track, "Added to Player")],
       });
+
       return;
     }
 
-    // If this became queue position #1 and we did not already prepare it, start NOW.
-    if (session.queue.length === 1 && !preparedController) schedulePrefetch(session);
+    /*
+     * If this is now the first waiting item and no controller was already
+     * prepared, begin prefetch immediately.
+     */
+    if (session.queue.length === 1 && !session.prefetched) {
+      schedulePrefetch(session);
+    }
 
-    await deferPromise;
-    await interaction.editReply({
+    await safeEditReply(interaction, {
       embeds: [
         buildTrackEmbed(track, "Added to Queue", 0x3498db).addFields({
           name: "Queue Position",
@@ -797,10 +866,18 @@ export async function handlePlayCommand(interaction) {
       ],
     });
   } catch (playError) {
-    preparedController?.stop();
+    /*
+     * Only clean up a controller that was never transferred to the session.
+     * An interaction reply failure must not terminate active playback.
+     */
+    unownedController?.stop();
+
     console.error("Music start failed:", playError);
-    await deferPromise.catch(() => null);
-    await interaction.editReply("I could not start the YouTube audio stream.");
+
+    await safeEditReply(
+      interaction,
+      "I could not start the YouTube audio stream.",
+    );
   }
 }
 
@@ -808,12 +885,12 @@ export async function handleSkipCommand(interaction) {
   const { session, error } = await getSessionForControl(interaction);
 
   if (error) {
-    await interaction.reply({ content: error, ephemeral: true });
+    await interaction.reply({ content: error, flags: MessageFlags.Ephemeral });
     return;
   }
 
   if (!session.current) {
-    await interaction.reply({ content: "There is no song playing right now.", ephemeral: true });
+    await interaction.reply({ content: "There is no song playing right now.", flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -835,7 +912,7 @@ export async function handleStopCommand(interaction) {
   const { error } = await getSessionForControl(interaction);
 
   if (error) {
-    await interaction.reply({ content: error, ephemeral: true });
+    await interaction.reply({ content: error, flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -847,17 +924,17 @@ export async function handlePauseCommand(interaction) {
   const { session, error } = await getSessionForControl(interaction);
 
   if (error) {
-    await interaction.reply({ content: error, ephemeral: true });
+    await interaction.reply({ content: error, flags: MessageFlags.Ephemeral });
     return;
   }
 
   if (session.player.state.status !== AudioPlayerStatus.Playing) {
-    await interaction.reply({ content: "There is no playing song to pause.", ephemeral: true });
+    await interaction.reply({ content: "There is no playing song to pause.", flags: MessageFlags.Ephemeral });
     return;
   }
 
   if (!session.player.pause()) {
-    await interaction.reply({ content: "I could not pause the song.", ephemeral: true });
+    await interaction.reply({ content: "I could not pause the song.", flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -868,7 +945,7 @@ export async function handleResumeCommand(interaction) {
   const { session, error } = await getSessionForControl(interaction);
 
   if (error) {
-    await interaction.reply({ content: error, ephemeral: true });
+    await interaction.reply({ content: error, flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -876,12 +953,12 @@ export async function handleResumeCommand(interaction) {
     session.player.state.status !== AudioPlayerStatus.Paused &&
     session.player.state.status !== AudioPlayerStatus.AutoPaused
   ) {
-    await interaction.reply({ content: "The music is not paused.", ephemeral: true });
+    await interaction.reply({ content: "The music is not paused.", flags: MessageFlags.Ephemeral });
     return;
   }
 
   if (!session.player.unpause()) {
-    await interaction.reply({ content: "I could not resume the song.", ephemeral: true });
+    await interaction.reply({ content: "I could not resume the song.", flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -953,7 +1030,7 @@ export async function handleNowPlayingCommand(interaction) {
   const session = musicSessions.get(interaction.guildId);
 
   if (!session?.current) {
-    await interaction.reply({ content: "There is no song playing right now.", ephemeral: true });
+    await interaction.reply({ content: "There is no song playing right now.", flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -976,12 +1053,12 @@ export async function handleRemoveCommand(interaction) {
   const { session, error } = await getSessionForControl(interaction);
 
   if (error) {
-    await interaction.reply({ content: error, ephemeral: true });
+    await interaction.reply({ content: error, flags: MessageFlags.Ephemeral });
     return;
   }
 
   if (session.queue.length === 0) {
-    await interaction.reply({ content: "The queue is empty.", ephemeral: true });
+    await interaction.reply({ content: "The queue is empty.", flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -990,7 +1067,7 @@ export async function handleRemoveCommand(interaction) {
   if (position < 1 || position > session.queue.length) {
     await interaction.reply({
       content: `Choose a position between **1** and **${session.queue.length}**.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -1005,14 +1082,14 @@ export async function handleShuffleCommand(interaction) {
   const { session, error } = await getSessionForControl(interaction);
 
   if (error) {
-    await interaction.reply({ content: error, ephemeral: true });
+    await interaction.reply({ content: error, flags: MessageFlags.Ephemeral });
     return;
   }
 
   if (session.queue.length < 2) {
     await interaction.reply({
       content: "There are not enough songs in the queue to shuffle.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -1030,14 +1107,14 @@ export async function handleLoopCommand(interaction) {
   const { session, error } = await getSessionForControl(interaction);
 
   if (error) {
-    await interaction.reply({ content: error, ephemeral: true });
+    await interaction.reply({ content: error, flags: MessageFlags.Ephemeral });
     return;
   }
 
   const mode = interaction.options.getString("mode", true);
 
   if (!["off", "track", "queue"].includes(mode)) {
-    await interaction.reply({ content: "Invalid loop mode.", ephemeral: true });
+    await interaction.reply({ content: "Invalid loop mode.", flags: MessageFlags.Ephemeral });
     return;
   }
 
