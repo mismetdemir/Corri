@@ -20,6 +20,8 @@ import { fileURLToPath } from "node:url";
 
 const musicSessions = new Map();
 
+console.log("[music] Corri music engine v3.2 classic-search loaded");
+
 const IDLE_DISCONNECT_MS = 2 * 60 * 1000;
 const MAX_QUEUE_DISPLAY = 15;
 const PREFETCH_BUFFER_BYTES = 512 * 1024;
@@ -59,7 +61,10 @@ let youtubePromise = null;
 const trackCache = new Map();
 
 function getYouTube() {
-  if (!youtubePromise) youtubePromise = Innertube.create();
+  if (!youtubePromise) {
+    youtubePromise = Innertube.create();
+  }
+
   return youtubePromise;
 }
 
@@ -123,12 +128,24 @@ function putCachedTrack(query, track) {
 }
 
 function searchVideoToTrack(video, query, requestedBy) {
-  const id = video?.video_id || video?.id;
+  const id = video?.id || video?.video_id || video?.endpoint?.payload?.videoId || null;
   if (!id) return null;
 
-  const title = video.title?.toString?.() || String(video.title || query);
-  const author = video.author?.name || video.author?.toString?.() || "Unknown channel";
-  const durationValue = Number(video.duration?.seconds);
+  const title =
+    video.title?.toString?.() ||
+    video.title?.text ||
+    String(video.title || query);
+
+  const author =
+    video.author?.name ||
+    video.author?.title?.toString?.() ||
+    video.author?.toString?.() ||
+    "Unknown channel";
+
+  const durationValue = Number(
+    video.duration?.seconds ??
+    video.duration?.text?.split(":").reduce((total, part) => total * 60 + Number(part), 0),
+  );
   const duration = Number.isFinite(durationValue) && durationValue > 0 ? durationValue : null;
   const thumbnail =
     video.best_thumbnail?.url ||
@@ -183,49 +200,87 @@ async function resolveTrack(query, requestedBy) {
 
   const startedAt = performance.now();
   const youtube = await getYouTube();
-  const videoId = extractYouTubeVideoId(cleanQuery);
-  let track;
 
-  if (videoId) {
-    try {
-      const info = await youtube.getBasicInfo(videoId);
-      track = basicInfoToTrack(info, videoId, cleanQuery, requestedBy);
-    } catch (error) {
-      console.warn(
-        `[music] URL metadata lookup failed for ${videoId}; using exact URL anyway:`,
-        error.message,
-      );
+  let videoId = extractYouTubeVideoId(cleanQuery);
 
-      track = {
-        key: randomUUID(),
-        query: cleanQuery,
-        target: `https://www.youtube.com/watch?v=${videoId}`,
-        id: videoId,
-        title: "YouTube video",
-        url: `https://www.youtube.com/watch?v=${videoId}`,
-        author: "YouTube",
-        duration: null,
-        thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-        requestedBy,
-        metadataResolved: false,
-      };
+  if (!videoId) {
+    /*
+     * This is the same search strategy Corri used before the aggressive
+     * yt-dlp search optimization: YouTube.js chooses the normal YouTube
+     * search result, then Corri resolves that exact video.
+     */
+    const search = await youtube.search(cleanQuery, {
+      type: "video",
+    });
+
+    const videos = Array.from(search.videos || []);
+    const firstVideo = videos[0];
+
+    if (!firstVideo) {
+      return null;
     }
-  } else {
-    const search = await youtube.search(cleanQuery, { type: "video" });
-    const videos = search.videos || [];
-    const firstVideo =
-      videos.find((video) => video?.video_id && !video.is_live && !video.is_upcoming) ||
-      videos.find((video) => video?.video_id);
 
-    if (!firstVideo) return null;
-    track = searchVideoToTrack(firstVideo, cleanQuery, requestedBy);
+    /*
+     * Older YouTube.js builds exposed `video_id`; newer builds may expose
+     * `id`. This fallback does not change ranking — it only reads the ID
+     * from the first result that YouTube.js already selected.
+     */
+    videoId =
+      firstVideo.video_id ||
+      firstVideo.id ||
+      firstVideo.endpoint?.payload?.videoId ||
+      null;
+
+    if (!videoId) {
+      console.warn(
+        `[music] First YouTube result did not expose a video ID for: ${cleanQuery}`,
+      );
+      return null;
+    }
   }
 
-  if (!track) return null;
+  /*
+   * Keep the old metadata flow too. It costs one extra YouTube request,
+   * but it gives reliable title/channel/duration/thumbnail before the
+   * queue message is sent.
+   */
+  const info = await youtube.getBasicInfo(videoId);
+  const basicInfo = info.basic_info;
+
+  if (!basicInfo?.title) {
+    return null;
+  }
+
+  const durationValue = Number(basicInfo.duration);
+
+  const track = {
+    key: randomUUID(),
+    query: cleanQuery,
+    target: `https://www.youtube.com/watch?v=${videoId}`,
+    id: videoId,
+    title: basicInfo.title,
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    author:
+      basicInfo.author ||
+      basicInfo.channel?.name ||
+      "Unknown channel",
+    duration:
+      Number.isFinite(durationValue) && durationValue > 0
+        ? durationValue
+        : null,
+    thumbnail:
+      basicInfo.thumbnail?.[0]?.url ||
+      `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    requestedBy,
+    metadataResolved: true,
+  };
+
   putCachedTrack(cleanQuery, track);
 
   console.log(
-    `[music] YouTube resolved in ${Math.round(performance.now() - startedAt)} ms: ${track.title} — ${track.author}`,
+    `[music] classic YouTube search resolved in ${Math.round(
+      performance.now() - startedAt,
+    )} ms: ${track.title} — ${track.author}`,
   );
 
   return track;
