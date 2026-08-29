@@ -249,15 +249,14 @@ async function sendLog(
   }
 }
 
-client.once(
-  Events.ClientReady,
+client.once(Events.ClientReady, (readyClient) => {
+  readyClient.user.setPresence({
+    status: "invisible",
+    activities: [],
+  });
 
-  (readyClient) => {
-    console.log(
-      `${readyClient.user.tag} is online!`,
-    );
-  },
-);
+  console.log(`${readyClient.user.tag} is online!`);
+});
 
 client.on(
   Events.MessageCreate,
