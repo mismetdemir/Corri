@@ -16,6 +16,18 @@ export async function runHelpCommand(interaction) {
         name: "/honeypot",
         inline: false,
       },
+      {
+        name: "/play <name or YouTube link>",
+        inline: false,
+      },
+      {
+        name: "/skip",
+        inline: false,
+      },
+      {
+        name: "/stop",
+        inline: false,
+      },
     )
     .setTimestamp()
     .setFooter({ text: "Corri Bot" });
