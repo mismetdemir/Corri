@@ -9,10 +9,10 @@ import {
   joinVoiceChannel,
 } from "@discordjs/voice";
 import { EmbedBuilder, MessageFlags, PermissionFlagsBits } from "discord.js";
+import { Innertube } from "youtubei.js";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { PassThrough } from "node:stream";
@@ -23,7 +23,8 @@ const musicSessions = new Map();
 const IDLE_DISCONNECT_MS = 2 * 60 * 1000;
 const MAX_QUEUE_DISPLAY = 15;
 const PREFETCH_BUFFER_BYTES = 512 * 1024;
-const METADATA_WAIT_MS = 1_000;
+const TRACK_CACHE_TTL_MS = 30 * 60 * 1000;
+const TRACK_CACHE_MAX = 100;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -45,104 +46,189 @@ const FORMAT_SELECTOR =
 // Skip manifests/subtitle work that Corri never uses.
 const YOUTUBE_EXTRACTOR_ARGS = "youtube:skip=hls,dash,translated_subs";
 
-// Metadata is written by the SAME yt-dlp process that streams the audio.
-// This removes youtubei.js and its extra search/info requests from the critical path.
-const METADATA_TEMPLATE =
-  "%(.{id,title,webpage_url,uploader,channel,duration,thumbnail})j";
+/*
+ * Search/metadata resolution uses YouTube's own internal API through
+ * youtubei.js. yt-dlp is then given the exact watch URL instead of doing
+ * its own text search.
+ *
+ * Text search uses a single YouTube request. We intentionally do NOT call
+ * getBasicInfo() after search because the search result already contains
+ * the metadata Corri needs for the queue embed.
+ */
+let youtubePromise = null;
+const trackCache = new Map();
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function getYouTube() {
+  if (!youtubePromise) youtubePromise = Innertube.create();
+  return youtubePromise;
 }
 
-function safeUnlink(filePath) {
-  try {
-    fs.unlinkSync(filePath);
-  } catch {
-    // Already removed / never created.
+function normalizeQuery(input) {
+  return input.trim().replace(/\s+/g, " ");
+}
+
+function cacheKeyForQuery(query) {
+  const videoId = extractYouTubeVideoId(query);
+  return videoId ? `video:${videoId}` : `search:${query.toLocaleLowerCase("en-US")}`;
+}
+
+function trimTrackCache() {
+  while (trackCache.size > TRACK_CACHE_MAX) {
+    const oldestKey = trackCache.keys().next().value;
+    if (!oldestKey) break;
+    trackCache.delete(oldestKey);
   }
 }
 
-function isHttpUrl(input) {
-  try {
-    const url = new URL(input);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
+function getCachedTrack(query, requestedBy) {
+  const key = cacheKeyForQuery(query);
+  const cached = trackCache.get(key);
+  if (!cached) return null;
 
-function extractYouTubeVideoId(input) {
-  try {
-    const url = new URL(input);
-    const host = url.hostname.replace(/^www\./, "").toLowerCase();
-
-    if (host === "youtu.be") {
-      return url.pathname.split("/").filter(Boolean)[0] || null;
-    }
-
-    if (host === "youtube.com" || host.endsWith(".youtube.com")) {
-      if (url.pathname === "/watch") return url.searchParams.get("v");
-
-      const parts = url.pathname.split("/").filter(Boolean);
-      if (["shorts", "live", "embed"].includes(parts[0])) {
-        return parts[1] || null;
-      }
-    }
-  } catch {
-    // Not a URL.
+  if (Date.now() - cached.cachedAt > TRACK_CACHE_TTL_MS) {
+    trackCache.delete(key);
+    return null;
   }
 
-  return null;
-}
-
-function createTrack(query, requestedBy) {
-  const cleanQuery = query.trim();
-  const videoId = extractYouTubeVideoId(cleanQuery);
+  trackCache.delete(key);
+  trackCache.set(key, cached);
 
   return {
+    ...cached.track,
     key: randomUUID(),
-    query: cleanQuery,
-    target: isHttpUrl(cleanQuery) ? cleanQuery : `ytsearch1:${cleanQuery}`,
-    id: videoId,
-    title: cleanQuery,
-    url: videoId
-      ? `https://www.youtube.com/watch?v=${videoId}`
-      : isHttpUrl(cleanQuery)
-        ? cleanQuery
-        : null,
-    author: "YouTube",
-    duration: null,
-    thumbnail: videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : null,
+    query,
     requestedBy,
-    metadataResolved: false,
   };
 }
 
-function applyMetadata(track, metadata) {
-  if (!metadata || typeof metadata !== "object") return;
+function putCachedTrack(query, track) {
+  const key = cacheKeyForQuery(query);
 
-  if (metadata.id) track.id = String(metadata.id);
-  if (metadata.title) track.title = String(metadata.title);
+  trackCache.delete(key);
+  trackCache.set(key, {
+    cachedAt: Date.now(),
+    track: {
+      target: track.target,
+      id: track.id,
+      title: track.title,
+      url: track.url,
+      author: track.author,
+      duration: track.duration,
+      thumbnail: track.thumbnail,
+      metadataResolved: true,
+    },
+  });
 
-  if (metadata.webpage_url) {
-    track.url = String(metadata.webpage_url);
-  } else if (track.id) {
-    track.url = `https://www.youtube.com/watch?v=${track.id}`;
+  trimTrackCache();
+}
+
+function searchVideoToTrack(video, query, requestedBy) {
+  const id = video?.video_id || video?.id;
+  if (!id) return null;
+
+  const title = video.title?.toString?.() || String(video.title || query);
+  const author = video.author?.name || video.author?.toString?.() || "Unknown channel";
+  const durationValue = Number(video.duration?.seconds);
+  const duration = Number.isFinite(durationValue) && durationValue > 0 ? durationValue : null;
+  const thumbnail =
+    video.best_thumbnail?.url ||
+    video.thumbnails?.[0]?.url ||
+    `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+  const url = `https://www.youtube.com/watch?v=${id}`;
+
+  return {
+    key: randomUUID(),
+    query,
+    target: url,
+    id,
+    title,
+    url,
+    author,
+    duration,
+    thumbnail,
+    requestedBy,
+    metadataResolved: true,
+  };
+}
+
+function basicInfoToTrack(info, videoId, query, requestedBy) {
+  const basic = info?.basic_info || {};
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const durationValue = Number(basic.duration);
+  const duration = Number.isFinite(durationValue) && durationValue > 0 ? durationValue : null;
+
+  return {
+    key: randomUUID(),
+    query,
+    target: url,
+    id: videoId,
+    title: basic.title || "YouTube video",
+    url,
+    author: basic.author || basic.channel?.name || "Unknown channel",
+    duration,
+    thumbnail: basic.thumbnail?.[0]?.url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    requestedBy,
+    metadataResolved: Boolean(basic.title),
+  };
+}
+
+async function resolveTrack(query, requestedBy) {
+  const cleanQuery = normalizeQuery(query);
+  const cached = getCachedTrack(cleanQuery, requestedBy);
+
+  if (cached) {
+    console.log(`[music] resolver cache hit: ${cached.title}`);
+    return cached;
   }
 
-  track.author =
-    metadata.channel || metadata.uploader || track.author || "Unknown channel";
+  const startedAt = performance.now();
+  const youtube = await getYouTube();
+  const videoId = extractYouTubeVideoId(cleanQuery);
+  let track;
 
-  const duration = Number(metadata.duration);
-  if (Number.isFinite(duration) && duration > 0) track.duration = duration;
+  if (videoId) {
+    try {
+      const info = await youtube.getBasicInfo(videoId);
+      track = basicInfoToTrack(info, videoId, cleanQuery, requestedBy);
+    } catch (error) {
+      console.warn(
+        `[music] URL metadata lookup failed for ${videoId}; using exact URL anyway:`,
+        error.message,
+      );
 
-  if (metadata.thumbnail) {
-    track.thumbnail = String(metadata.thumbnail);
-  } else if (track.id) {
-    track.thumbnail = `https://i.ytimg.com/vi/${track.id}/hqdefault.jpg`;
+      track = {
+        key: randomUUID(),
+        query: cleanQuery,
+        target: `https://www.youtube.com/watch?v=${videoId}`,
+        id: videoId,
+        title: "YouTube video",
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        author: "YouTube",
+        duration: null,
+        thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+        requestedBy,
+        metadataResolved: false,
+      };
+    }
+  } else {
+    const search = await youtube.search(cleanQuery, { type: "video" });
+    const videos = search.videos || [];
+    const firstVideo =
+      videos.find((video) => video?.video_id && !video.is_live && !video.is_upcoming) ||
+      videos.find((video) => video?.video_id);
+
+    if (!firstVideo) return null;
+    track = searchVideoToTrack(firstVideo, cleanQuery, requestedBy);
   }
 
-  track.metadataResolved = true;
+  if (!track) return null;
+  putCachedTrack(cleanQuery, track);
+
+  console.log(
+    `[music] YouTube resolved in ${Math.round(performance.now() - startedAt)} ms: ${track.title} — ${track.author}`,
+  );
+
+  return track;
 }
 
 function formatDuration(seconds) {
@@ -178,68 +264,28 @@ function buildTrackEmbed(track, title, color = 0x2ecc71) {
   return embed;
 }
 
-async function readMetadataWhenReady(filePath, track, controller) {
-  const deadline = Date.now() + 30_000;
-
-  while (!controller.stopped && Date.now() < deadline) {
-    try {
-      const text = await fs.promises.readFile(filePath, "utf8");
-      const line = text.trim().split(/\r?\n/).find(Boolean);
-
-      if (line) {
-        const metadata = JSON.parse(line);
-        applyMetadata(track, metadata);
-        safeUnlink(filePath);
-        return metadata;
-      }
-    } catch (error) {
-      if (error.code !== "ENOENT") {
-        console.error("Could not read yt-dlp metadata:", error.message);
-        safeUnlink(filePath);
-        return null;
-      }
-    }
-
-    if (controller.closed && controller.exitCode !== null) break;
-    await sleep(40);
-  }
-
-  safeUnlink(filePath);
-  return null;
-}
-
 function createTrackStream(track, { prefetch = false } = {}) {
   if (!fs.existsSync(YT_DLP_BINARY)) {
     throw new Error(`yt-dlp binary not found at ${YT_DLP_BINARY}. Run npm install first.`);
   }
 
-  const metadataPath = path.join(os.tmpdir(), `corri-${track.key}.json`);
-  safeUnlink(metadataPath);
-
+  // The resolver already chose one exact YouTube video. yt-dlp only extracts
+  // and streams that video's native WebM/Opus audio.
   const args = [
-    "--output",
-    "-",
-    "--format",
-    FORMAT_SELECTOR,
+    "--output", "-",
+    "--format", FORMAT_SELECTOR,
     "--no-playlist",
     "--no-progress",
     "--quiet",
     "--no-warnings",
-    "--no-simulate",
-    "--cache-dir",
-    YT_DLP_CACHE_DIR,
-    "--js-runtimes",
-    `node:${process.execPath}`,
-    "--extractor-args",
-    YOUTUBE_EXTRACTOR_ARGS,
-    "--print-to-file",
-    `before_dl:${METADATA_TEMPLATE}`,
-    metadataPath,
+    "--cache-dir", YT_DLP_CACHE_DIR,
+    "--js-runtimes", `node:${process.execPath}`,
+    "--extractor-args", YOUTUBE_EXTRACTOR_ARGS,
     track.target,
   ];
 
   const startedAt = performance.now();
-  console.log(`[music] ${prefetch ? "prefetch" : "stream"} start: ${track.query}`);
+  console.log(`[music] ${prefetch ? "prefetch" : "stream"} start: ${track.title}`);
 
   const ytProcess = spawn(YT_DLP_BINARY, args, {
     windowsHide: true,
@@ -259,7 +305,7 @@ function createTrackStream(track, { prefetch = false } = {}) {
   ytProcess.stdout.once("data", () => {
     firstByteAt = performance.now();
     console.log(
-      `[music] yt-dlp first audio byte: ${Math.round(firstByteAt - startedAt)} ms (${track.query})`,
+      `[music] yt-dlp first audio byte: ${Math.round(firstByteAt - startedAt)} ms (${track.title})`,
     );
   });
 
@@ -271,7 +317,7 @@ function createTrackStream(track, { prefetch = false } = {}) {
 
   ytProcess.on("error", (error) => {
     if (!intentionallyStopped) {
-      console.error(`[music] yt-dlp process error (${track.query}):`, error);
+      console.error(`[music] yt-dlp process error (${track.title}):`, error);
     }
   });
 
@@ -281,72 +327,40 @@ function createTrackStream(track, { prefetch = false } = {}) {
     track,
     prefetched: prefetch,
     stopped: false,
-    metadataPath,
-    metadataPromise: null,
     startedAt,
-    get closed() {
-      return closed;
-    },
-    get exitCode() {
-      return exitCode;
-    },
-    get firstByteAt() {
-      return firstByteAt;
-    },
+    get closed() { return closed; },
+    get exitCode() { return exitCode; },
+    get firstByteAt() { return firstByteAt; },
     stop() {
       if (controller.stopped) return;
-
       controller.stopped = true;
       intentionallyStopped = true;
 
       try {
         if (prefetch) ytProcess.stdout.unpipe(outputStream);
-      } catch {
-        // Ignore.
-      }
+      } catch {}
 
-      try {
-        outputStream.destroy();
-      } catch {
-        // Ignore.
-      }
+      try { outputStream.destroy(); } catch {}
 
       if (outputStream !== ytProcess.stdout) {
-        try {
-          ytProcess.stdout.destroy();
-        } catch {
-          // Ignore.
-        }
+        try { ytProcess.stdout.destroy(); } catch {}
       }
 
-      try {
-        ytProcess.stderr.destroy();
-      } catch {
-        // Ignore.
-      }
+      try { ytProcess.stderr.destroy(); } catch {}
 
       if (!closed) {
-        try {
-          ytProcess.kill("SIGTERM");
-        } catch {
-          // Already closed.
-        }
+        try { ytProcess.kill("SIGTERM"); } catch {}
       }
-
-      safeUnlink(metadataPath);
     },
   };
-
-  controller.metadataPromise = readMetadataWhenReady(metadataPath, track, controller);
 
   ytProcess.on("close", (code) => {
     closed = true;
     exitCode = code;
-
     if (intentionallyStopped) return;
 
     if (code !== 0) {
-      console.error(`[music] yt-dlp exited with code ${code}: ${track.query}`);
+      console.error(`[music] yt-dlp exited with code ${code}: ${track.title}`);
       if (errorOutput.trim()) console.error(errorOutput.trim());
     }
   });
@@ -354,10 +368,6 @@ function createTrackStream(track, { prefetch = false } = {}) {
   return controller;
 }
 
-async function waitForMetadata(controller, timeoutMs = METADATA_WAIT_MS) {
-  if (!controller?.metadataPromise) return;
-  await Promise.race([controller.metadataPromise.catch(() => null), sleep(timeoutMs)]);
-}
 
 async function sendSessionMessage(session, payload) {
   try {
@@ -530,13 +540,10 @@ function playNext(session) {
     // Prepare the effective next track immediately.
     schedulePrefetch(session);
 
-    // Metadata should never block audio playback.
-    void (async () => {
-      await waitForMetadata(trackStream);
-      await sendSessionMessage(session, {
-        embeds: [buildTrackEmbed(nextTrack, "Now Playing")],
-      });
-    })();
+    // Metadata was resolved before the track entered the queue.
+    void sendSessionMessage(session, {
+      embeds: [buildTrackEmbed(nextTrack, "Now Playing")],
+    });
 
     return true;
   } catch (error) {
@@ -719,12 +726,6 @@ async function getSessionForControl(interaction) {
 export async function handlePlayCommand(interaction) {
   const commandStartedAt = performance.now();
 
-  /*
-   * Discord requires the initial interaction acknowledgement very quickly.
-   * Do this BEFORE spawning yt-dlp, touching the voice connection, or doing
-   * any other potentially expensive work. On a throttled free host this is
-   * especially important.
-   */
   try {
     await interaction.deferReply();
   } catch (error) {
@@ -736,14 +737,12 @@ export async function handlePlayCommand(interaction) {
   }
 
   const query = interaction.options.getString("query", true).trim();
-
   if (!query) {
     await safeEditReply(interaction, "Enter a YouTube URL or search query.");
     return;
   }
 
   let voiceContext;
-
   try {
     voiceContext = await getVoiceContext(interaction);
   } catch (error) {
@@ -753,105 +752,84 @@ export async function handlePlayCommand(interaction) {
   }
 
   const { voiceChannel, error } = voiceContext;
-
   if (error) {
     await safeEditReply(interaction, error);
     return;
   }
 
   let session = musicSessions.get(interaction.guildId);
-
   if (session && session.voiceChannelId !== voiceChannel.id) {
-    await safeEditReply(
-      interaction,
-      "I am already playing music in another voice channel.",
-    );
+    await safeEditReply(interaction, "I am already playing music in another voice channel.");
     return;
   }
 
-  const track = createTrack(query, interaction.user.id);
+  // Begin Discord voice negotiation while YouTube search/metadata resolves.
+  const createdNewSession = !session;
+  if (!session) session = createMusicSession(interaction, voiceChannel);
+  session.textChannel = interaction.channel;
+
+  let track;
+  try {
+    track = await resolveTrack(query, interaction.user.id);
+  } catch (resolveError) {
+    console.error("[music] YouTube resolve failed:", resolveError);
+
+    if (createdNewSession && !session.current && session.queue.length === 0) {
+      destroySession(interaction.guildId);
+    }
+
+    await safeEditReply(interaction, "I could not find that video on YouTube.");
+    return;
+  }
+
+  if (!track) {
+    if (createdNewSession && !session.current && session.queue.length === 0) {
+      destroySession(interaction.guildId);
+    }
+
+    await safeEditReply(interaction, "I could not find a matching YouTube video.");
+    return;
+  }
 
   const shouldStartNow =
-    !session ||
-    (!session.current &&
-      !session.isLoading &&
-      session.player.state.status === AudioPlayerStatus.Idle &&
-      session.queue.length === 0);
+    !session.current &&
+    !session.isLoading &&
+    session.player.state.status === AudioPlayerStatus.Idle &&
+    session.queue.length === 0;
 
-  /*
-   * This variable represents a controller that is still owned by THIS
-   * function. As soon as we hand it to the session, it is set to null.
-   * Therefore an interaction/API error can never accidentally destroy an
-   * already-playing audio stream.
-   */
   let unownedController = null;
 
   try {
-    /*
-     * Start yt-dlp as early as possible. For the first song, yt-dlp and the
-     * Discord voice handshake then progress in parallel.
-     */
     if (
       shouldStartNow ||
-      (session &&
-        session.current &&
-        session.queue.length === 0 &&
-        session.loopMode !== "track")
+      (session.current && session.queue.length === 0 && session.loopMode !== "track")
     ) {
       unownedController = createTrackStream(track, { prefetch: true });
     }
 
-    if (!session) {
-      session = createMusicSession(interaction, voiceChannel);
-    }
-
-    session.textChannel = interaction.channel;
-
-    if (shouldStartNow) {
-      session.commandStartedAt = commandStartedAt;
-    }
+    if (shouldStartNow) session.commandStartedAt = commandStartedAt;
 
     session.queue.push(track);
 
     if (unownedController) {
       stopPrefetchedStream(session);
-
-      session.prefetched = {
-        track,
-        controller: unownedController,
-      };
-
-      /*
-       * Ownership has moved to the music session. Never stop this controller
-       * from the command handler's catch block after this point.
-       */
+      session.prefetched = { track, controller: unownedController };
       unownedController = null;
     }
 
     if (shouldStartNow) {
       const started = playNext(session);
-
       if (!started) {
         await safeEditReply(interaction, "I could not start the audio stream.");
         return;
       }
 
-      /*
-       * Do not block the slash-command response waiting for metadata.
-       * playNext() resolves metadata independently and sends the richer
-       * Now Playing embed when it becomes available.
-       */
       await safeEditReply(interaction, {
         embeds: [buildTrackEmbed(track, "Added to Player")],
       });
-
       return;
     }
 
-    /*
-     * If this is now the first waiting item and no controller was already
-     * prepared, begin prefetch immediately.
-     */
     if (session.queue.length === 1 && !session.prefetched) {
       schedulePrefetch(session);
     }
@@ -866,18 +844,9 @@ export async function handlePlayCommand(interaction) {
       ],
     });
   } catch (playError) {
-    /*
-     * Only clean up a controller that was never transferred to the session.
-     * An interaction reply failure must not terminate active playback.
-     */
     unownedController?.stop();
-
     console.error("Music start failed:", playError);
-
-    await safeEditReply(
-      interaction,
-      "I could not start the YouTube audio stream.",
-    );
+    await safeEditReply(interaction, "I could not start the YouTube audio stream.");
   }
 }
 
